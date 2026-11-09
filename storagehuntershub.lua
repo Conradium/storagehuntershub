@@ -1,4 +1,4 @@
--- Storage Hunters Hub 4.8.1 (Storage Hunters: Open World)
+-- Storage Hunters Hub 4.8.3 (Storage Hunters: Open World)
 -- Made by conradium, commissioned by rsl.
 -- Auto bid, auto open auctions and airdrops, take/open/repair won items, favorites,
 -- shelf listing, teleports and movement. Settings are saved.
@@ -6,7 +6,7 @@
 
 local env = getgenv()
 if env.SHHub and type(env.SHHub.stop) == "function" then pcall(env.SHHub.stop) end
-local Hub = { alive = true, version = "4.8.1" }
+local Hub = { alive = true, version = "4.8.3" }
 env.SHHub = Hub
 local Kit = (function()
 ---------------------------------------------------------------------------
@@ -1282,15 +1282,48 @@ local function guarded(lock, who, fn, ...)
 		task.wait(0.05)
 	end
 	lock.owner = who
+	lock.thread = coroutine.running()
 	if lock == Locks.body then Auto.busy = true end
 	local result = table.pack(pcall(fn, ...))
-	lock.owner = nil
+	lock.owner, lock.thread = nil, nil
 	if lock == Locks.body then Auto.busy = false end
 	if not result[1] then return false, result[2] end
 	return true, table.unpack(result, 2, result.n)
 end
 local function runBody(who, fn, ...) return guarded(Locks.body, who, fn, ...) end
 local function runItems(who, fn, ...) return guarded(Locks.items, who, fn, ...) end
+
+-- Watchdog version for the automation loops: a step that runs past `limit`
+-- seconds (a game call that never answered) is stopped and every lock it held
+-- is freed, so one frozen call cannot stall the hub while you are away.
+local function guardedLimit(lock, who, limit, fn)
+	local t0 = os.clock()
+	while lock.owner do
+		if not Hub.alive then return false, "hub stopped" end
+		if os.clock() - t0 > 60 then return false, lock.owner .. " is still running" end
+		task.wait(0.05)
+	end
+	lock.owner = who
+	if lock == Locks.body then Auto.busy = true end
+	local done, result = false, nil
+	local worker
+	worker = task.spawn(function()
+		lock.thread = coroutine.running()
+		result = table.pack(pcall(fn))
+		done = true
+	end)
+	local started = os.clock()
+	while not done and Hub.alive and os.clock() - started < limit do task.wait(0.1) end
+	if not done then pcall(task.cancel, worker) end
+	-- free this lock, and any other lock the stopped step had taken inside
+	for _, l in pairs(Locks) do
+		if l == lock or (not done and l.thread == worker) then l.owner, l.thread = nil, nil end
+	end
+	if lock == Locks.body then Auto.busy = false end
+	if not done then return false, "stuck", true end
+	if not result[1] then return false, result[2] end
+	return true, table.unpack(result, 2, result.n)
+end
 
 -- Admin safety: while an admin is in the server (and you have not chosen to
 -- override), features are switched off and running work stops at its next step.
@@ -1311,11 +1344,56 @@ end
 -- Movement helpers (character and vehicle)
 ---------------------------------------------------------------------------
 
-local function firePrompt(p)
+-- Presses a prompt, trying three ways in order and stopping as soon as one
+-- worked:
+--   1. Roblox's own hold methods (exactly what holding the key does)
+--   2. a simulated key press through VirtualInputManager
+--   3. the executor's fireproximityprompt, as a last resort
+-- It runs on its own thread, so nothing here can hold the hub up; callers
+-- check the outcome themselves. isDone() says whether it worked; by default,
+-- when the prompt is gone or disabled (garage entrances, pickups, boxes).
+local firePrompt
+do
+local VIM = (function()
+	local ok, service = pcall(game.GetService, game, "VirtualInputManager")
+	return ok and service or nil
+end)()
+function firePrompt(p, isDone)
 	if not (p and p.Parent) then return false end
 	if p.HoldDuration > 0 then p.HoldDuration = 0 end
-	if type(fireproximityprompt) == "function" and pcall(fireproximityprompt, p) then return true end
-	return (pcall(function() p:InputHoldBegin(); task.wait(0.05); p:InputHoldEnd() end))
+	isDone = isDone or function() return not (p.Parent and p.Enabled) end
+	local function settled()
+		task.wait(0.6) -- give the server a moment to react
+		local ok, done = pcall(isDone)
+		return ok and done
+	end
+	task.spawn(function()
+		pcall(function() p:InputHoldBegin(); task.wait(0.05); p:InputHoldEnd() end)
+		if settled() then return end
+		local key = p.KeyboardKeyCode
+		if VIM and key and key ~= Enum.KeyCode.Unknown then
+			pcall(function()
+				VIM:SendKeyEvent(true, key, false, game)
+				task.wait(0.05)
+				VIM:SendKeyEvent(false, key, false, game)
+			end)
+			if settled() then return end
+		end
+		if type(fireproximityprompt) == "function" then pcall(fireproximityprompt, p) end
+	end)
+	return true
+end
+end
+
+-- Asks the game to load the area around pos, but never waits more than ~3.5 s.
+local function streamAround(pos)
+	local done = false
+	task.spawn(function()
+		pcall(LP.RequestStreamAroundAsync, LP, pos, 3)
+		done = true
+	end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < 3.5 do task.wait(0.1) end
 end
 
 local function exitVehicle()
@@ -1355,7 +1433,7 @@ local function tpTo(pos)
 	local char, hrp, hum = getChar()
 	if not (char and hrp and pos) then return false end
 	if hum and hum.SeatPart then hum.Sit = false; task.wait(0.1) end
-	pcall(LP.RequestStreamAroundAsync, LP, pos, 3)
+	streamAround(pos)
 	-- Look for floor just above the target, not from high up: indoors a high
 	-- ray hits the roof and lands you on top of the building.
 	local g = groundAt(pos, nil, 4)
@@ -1421,7 +1499,7 @@ local function enterVehicle(veh)
 	hrp.AssemblyLinearVelocity = Vector3.zero
 	task.wait(0.25)
 	local prompt = seat:FindFirstChild("VehiclePrompt", true)
-	if prompt then firePrompt(prompt) end
+	if prompt then firePrompt(prompt, function() return seatedIn(veh) end) end
 	for _ = 1, 15 do
 		if seatedIn(veh) then return true end
 		task.wait(0.1)
@@ -1717,7 +1795,7 @@ end
 -- auctions and airdrops. Returns true once the auction has started.
 local function openGarage(g, key, label)
 	Auto.lastJoin = os.clock()
-	pcall(LP.RequestStreamAroundAsync, LP, g:GetPivot().Position, 3)
+	streamAround(g:GetPivot().Position)
 	local square = g:FindFirstChild("EntrySquare")
 	local part = square and square:FindFirstChild("PromptPart")
 	local prompt = part and part:FindFirstChild("EnterAuction")
@@ -1746,7 +1824,7 @@ local function openGarage(g, key, label)
 	placeNear(part.Position, 2.5)
 	task.wait(0.4)
 	if halted() then return false end
-	firePrompt(prompt)
+	firePrompt(prompt, function() return A.active or not (prompt.Parent and prompt.Enabled) end)
 	local t0 = os.clock()
 	while os.clock() - t0 < 10 do
 		if A.active then Auto.joined += 1; return true end
@@ -2428,7 +2506,7 @@ local function dumpStep(force)
 		-- stand on the unload spot, spawn the car there (V), then sit in it:
 		-- the game counts you as in the zone only while seated
 		Auto.status = "Bringing your car to the plot's unload spot"
-		pcall(LP.RequestStreamAroundAsync, LP, pt, 3)
+		streamAround(pt)
 		placeNear(pt, 0.5)
 		task.wait(0.3)
 		local spawned, why = spawnCarHere()
@@ -3381,8 +3459,12 @@ task.spawn(function()
 		local ok, err = pcall(function()
 			-- favorite first, so new keepers are protected before shelves are filled
 			local function chore(name, fn)
-				local done, why = runItems(name, fn)
-				if not done then Auto.listNote = name .. ": " .. tostring(why) end
+				local done, why, stuck = guardedLimit(Locks.items, name, 120, fn)
+				if stuck then
+					Auto.listNote = name .. " froze and was stopped; it will run again"
+				elseif not done then
+					Auto.listNote = name .. ": " .. tostring(why)
+				end
 			end
 			if S.autoFav and now - Auto.lastFav >= 20 then Auto.lastFav = now; chore("auto favorite", favoritePass) end
 			if S.autoSafe and now - (Auto.lastSafe or 0) >= 6 then Auto.lastSafe = now; chore("open safes", Safe.pass) end
@@ -3399,10 +3481,17 @@ task.spawn(function()
 	while Hub.alive do
 		local anyAuto = S.autoTake or S.autoOpen or S.autoRepair or S.autoUnload or S.autoAuction or S.autoAirdrop
 		if anyAuto then
-			-- waits its turn if a button (quick open, teleport, unload) is moving you
-			local ok, err = runBody("automation", autoStep)
+			-- waits its turn if a button (quick open, teleport, unload) is moving you;
+			-- a step that freezes for 3 minutes is stopped so the loop carries on
+			local ok, err, stuck = guardedLimit(Locks.body, "automation", 180, autoStep)
 			Auto.phase = nil
-			if not ok then Auto.status = "Error: " .. tostring(err) end
+			if stuck then
+				Auto.stuckRecoveries = (Auto.stuckRecoveries or 0) + 1
+				Auto.status = "A step froze and was stopped; carrying on"
+				task.spawn(exitVehicle)
+			elseif not ok then
+				Auto.status = "Error: " .. tostring(err)
+			end
 		elseif not Locks.body.owner then
 			Auto.status = A.active and ("In auction" .. (A.hasBlue and " (outlined item in lot)" or "")) or "Idle"
 			if A.active and os.clock() - (Auto.lastScan or 0) > 1 then Auto.lastScan = os.clock(); scanLotForBlue() end
