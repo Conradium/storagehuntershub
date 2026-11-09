@@ -1,4 +1,4 @@
--- Storage Hunters Hub 4.3.1 (Storage Hunters: Open World)
+-- Storage Hunters Hub 4.8.1 (Storage Hunters: Open World)
 -- Made by conradium, commissioned by rsl.
 -- Auto bid, auto open auctions and airdrops, take/open/repair won items, favorites,
 -- shelf listing, teleports and movement. Settings are saved.
@@ -6,7 +6,7 @@
 
 local env = getgenv()
 if env.SHHub and type(env.SHHub.stop) == "function" then pcall(env.SHHub.stop) end
-local Hub = { alive = true, version = "4.3.1" }
+local Hub = { alive = true, version = "4.8.1" }
 env.SHHub = Hub
 local Kit = (function()
 ---------------------------------------------------------------------------
@@ -238,12 +238,27 @@ function Kit.Window(opts)
 			if main.Visible then self:Hide(false) else self:Restore() end
 			return
 		end
-		local binds = self.values.keybinds
-		local id = type(binds) == "table" and binds[input.KeyCode.Name]
-		local sw = id and self.switches[id]
-		if sw then
-			sw.flip()
-			self:SetStatus(sw.text .. ": " .. (self.values[id] and "on" or "off"), "ok")
+		local ids = self:_idsFor(input.KeyCode.Name)
+		local notify = self.values.keybindNotify ~= false
+		if #ids == 1 then
+			local id, sw = ids[1], self.switches[ids[1]]
+			local msg = sw.flip()
+			local state = self.values[id] and "ON" or "OFF"
+			self:SetStatus(type(msg) == "string" and msg or (sw.text .. ": " .. state), "ok")
+			if notify then self:Notify(sw.text .. ": " .. state, type(msg) == "string" and msg or ("Key " .. input.KeyCode.Name), 3) end
+		elseif #ids > 1 then
+			-- a shared key moves its switches together: all on if any is off, else all off
+			local anyOff = false
+			for _, id in ipairs(ids) do if self.values[id] ~= true then anyOff = true end end
+			local names = {}
+			for _, id in ipairs(ids) do
+				local set = self.setters[id]
+				if set then set(anyOff, true) end
+				names[#names + 1] = self.switches[id].text
+			end
+			local state = anyOff and "ON" or "OFF"
+			self:SetStatus(string.format("%s: %d switches %s", input.KeyCode.Name, #ids, state), "ok")
+			if notify then self:Notify(input.KeyCode.Name .. ": " .. state, table.concat(names, ", "), 4) end
 		end
 	end))
 	self.onClose = opts.OnClose
@@ -431,19 +446,38 @@ function Kit:Toast(text, seconds)
 	task.delay(seconds or 6, function() if t.Parent then t:Destroy() end end)
 end
 
--- Keybinds: values.keybinds maps a KeyCode name to a switch Id.
+-- Keybinds: values.keybinds maps a KeyCode name to a list of switch Ids.
+-- One key can drive several switches (they move together); each switch has
+-- at most one key. Older saves stored a single Id per key; those still work.
 function Kit:_binds()
 	if type(self.values.keybinds) ~= "table" then self.values.keybinds = {} end
-	return self.values.keybinds
+	local binds = self.values.keybinds
+	for k, v in pairs(binds) do
+		if type(v) == "string" then binds[k] = { v } end
+	end
+	return binds
+end
+
+function Kit:_idsFor(keyName)
+	local list = self:_binds()[keyName]
+	local ids = {}
+	for _, id in ipairs(type(list) == "table" and list or {}) do
+		if self.switches[id] then ids[#ids + 1] = id end
+	end
+	return ids
 end
 
 function Kit:_paintChips()
-	local byId = {}
-	for keyName, id in pairs(self:_binds()) do byId[id] = keyName end
+	local byId, shared = {}, {}
+	for keyName, ids in pairs(self:_binds()) do
+		for _, id in ipairs(ids) do byId[id] = keyName end
+		shared[keyName] = #ids > 1
+	end
 	for id, chip in pairs(self.chips) do
 		local k = byId[id]
-		chip.Text = k and k:gsub("^Left", "L"):gsub("^Right", "R") or "+"
-		chip.TextColor3 = k and C.text or C.faint
+		local short = k and (k:gsub("^Left", "L"):gsub("^Right", "R")) or nil
+		chip.Text = short and (shared[k] and (short .. "*") or short) or "+"
+		chip.TextColor3 = k and (shared[k] and C.accent or C.text) or C.faint
 	end
 end
 
@@ -452,9 +486,15 @@ function Kit:_capture(keyCode)
 	self.capturing = nil
 	local binds = self:_binds()
 	if keyCode ~= Enum.KeyCode.Escape then
-		for k, v in pairs(binds) do if v == id then binds[k] = nil end end
+		-- a switch has one key: take it off whatever key it had
+		for k, ids in pairs(binds) do
+			for i = #ids, 1, -1 do if ids[i] == id then table.remove(ids, i) end end
+			if #ids == 0 then binds[k] = nil end
+		end
 		if keyCode ~= Enum.KeyCode.Backspace and keyCode ~= Enum.KeyCode.Delete and keyCode ~= self.toggleKey then
-			binds[keyCode.Name] = id -- a key drives one switch; this replaces any older use
+			local ids = binds[keyCode.Name] or {}
+			table.insert(ids, id) -- joins any switches already on this key
+			binds[keyCode.Name] = ids
 		end
 		self:_set("keybinds", binds, true)
 	end
@@ -462,8 +502,8 @@ function Kit:_capture(keyCode)
 end
 
 -- A small key chip on a switch row; click it, then press a key.
-function Kit:_bindChip(row, x, id, text, flip)
-	self.switches[id] = { text = text, flip = flip }
+function Kit:_bindChip(row, x, id, text, flip, tab, isSwitch)
+	self.switches[id] = { text = text, flip = flip, tab = tab, isSwitch = isSwitch ~= false }
 	local chip = new("TextButton", {
 		AutoButtonColor = false, Text = "+", TextSize = 11, Font = FONT_MED, TextColor3 = C.faint,
 		BackgroundColor3 = C.bg, Size = UDim2.fromOffset(34, 22), Position = UDim2.new(1, x, 0.5, -11),
@@ -488,10 +528,11 @@ function Kit:SetStatus(text, state)
 	if self.pillText then self.pillText.Text = text; self.pillDot.BackgroundColor3 = color end
 end
 
--- Sets a switch by Id without counting as a user change (no save).
-function Kit:SetSwitch(id, on)
+-- Sets a switch by Id. fire = true counts it as your change (saved, side
+-- effects run); otherwise it is a quiet change (used by admin safety).
+function Kit:SetSwitch(id, on, fire)
 	local set = self.setters[id]
-	if set then set(on, false) else self.values[id] = on end
+	if set then set(on, fire == true) else self.values[id] = on end
 end
 
 function Kit:Destroy()
@@ -631,8 +672,26 @@ function Tab:Step(o)
 	track.MouseButton1Click:Connect(function() api.Set(not kit.values[o.Id], true) end)
 	api.Set(o.Default == true, false)
 	kit.setters[o.Id] = api.Set
-	kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end)
+	kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end, self.button.Text)
 	return api
+end
+
+-- A row that runs an action from a key: name, key chip and a Run button.
+-- o = { Id, Text, Hint, OnPress } ; OnPress may return a status message.
+function Tab:KeyRow(o)
+	local row = self:_row(o.Hint and 44 or 38)
+	local text = self:_text(row, o.Text, o.Hint)
+	text.Size = UDim2.new(1, -150, 1, 0)
+	local run = new("TextButton", {
+		AutoButtonColor = false, Text = "Run", TextSize = 12, Font = FONT_BOLD, BackgroundColor3 = C.accent,
+		TextColor3 = C.bg, Size = UDim2.fromOffset(60, 26), Position = UDim2.new(1, -72, 0.5, -13),
+	}, row)
+	corner(run, 6)
+	run.MouseButton1Click:Connect(function()
+		local msg = o.OnPress()
+		if type(msg) == "string" then self.kit:SetStatus(msg, "ok") end
+	end)
+	self.kit:_bindChip(row, -114, o.Id, o.Text, o.OnPress, self.button.Text, false)
 end
 
 -- A name on the left, a value on the right; returns set(valueText).
@@ -718,7 +777,7 @@ function Tab:Toggle(o)
 	track.MouseButton1Click:Connect(function() api.Set(not kit.values[o.Id], true) end)
 	api.Set(o.Default == true, false)
 	kit.setters[o.Id] = api.Set
-	if o.Bind ~= false then kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end) end
+	if o.Bind ~= false then kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end, self.button.Text) end
 	return api
 end
 
@@ -809,7 +868,7 @@ function Tab:Rule(o)
 	api.SetValue(o.Value or 0, false)
 	api.SetOn(o.Default == true, false)
 	kit.setters[o.Id] = api.SetOn
-	kit:_bindChip(row, -198, o.Id, o.Text, function() api.SetOn(not kit.values[o.Id], true) end)
+	kit:_bindChip(row, -198, o.Id, o.Text, function() api.SetOn(not kit.values[o.Id], true) end, self.button.Text)
 	return api
 end
 
@@ -1169,11 +1228,41 @@ local Auto = { status = "Idle", busy = false, lastStep = 0, lastAuctionEnd = 0, 
 	picked = 0, opened = 0, repaired = 0, favorited = 0, listed = 0, accepted = 0, joined = 0 }
 local spotted = setmetatable({}, { __mode = "k" })
 
--- Session numbers for the Stats tab (since the hub started).
+-- Numbers for the Stats tab. Saved to a file so they keep counting across
+-- reloads and rejoins until you press Reset stats.
 local Stats = {
-	startedAt = os.clock(), startNetWorth = nil, won = 0, bidsPaid = 0, entryFees = 0, lootValue = 0,
-	mutated = 0, safes = 0, shelfSales = 0, salesCount = 0,
+	startedAt = os.clock(), trackedBefore = 0, since = os.date("%d %b %Y, %H:%M"), startNetWorth = nil,
+	won = 0, bidsPaid = 0, entryFees = 0, lootValue = 0, mutated = 0, safes = 0, shelfSales = 0, salesCount = 0,
+	path = DIR .. "/hub_stats.json",
 }
+local STAT_FIELDS = { "won", "bidsPaid", "entryFees", "lootValue", "mutated", "safes", "shelfSales", "salesCount" }
+local AUTO_FIELDS = { "joined", "picked", "favorited", "listed" }
+do
+	local ok, raw = pcall(function() return isfile(Stats.path) and readfile(Stats.path) end)
+	local okJ, data = false, nil
+	if ok and type(raw) == "string" and raw ~= "" then okJ, data = pcall(HttpService.JSONDecode, HttpService, raw) end
+	if okJ and type(data) == "table" then
+		for _, k in ipairs(STAT_FIELDS) do Stats[k] = tonumber(data[k]) or 0 end
+		for _, k in ipairs(AUTO_FIELDS) do Auto[k] = tonumber(data[k]) or 0 end
+		Stats.trackedBefore = tonumber(data.tracked) or 0
+		Stats.startNetWorth = tonumber(data.startNetWorth)
+		Stats.since = type(data.since) == "string" and data.since or Stats.since
+	end
+end
+function Stats.trackedSeconds() return Stats.trackedBefore + (os.clock() - Stats.startedAt) end
+function Stats.save()
+	local data = { tracked = Stats.trackedSeconds(), since = Stats.since, startNetWorth = Stats.startNetWorth }
+	for _, k in ipairs(STAT_FIELDS) do data[k] = Stats[k] end
+	for _, k in ipairs(AUTO_FIELDS) do data[k] = Auto[k] end
+	pcall(function() writefile(Stats.path, HttpService:JSONEncode(data)) end)
+end
+function Stats.reset()
+	for _, k in ipairs(STAT_FIELDS) do Stats[k] = 0 end
+	for _, k in ipairs(AUTO_FIELDS) do Auto[k] = 0 end
+	Stats.startedAt, Stats.trackedBefore, Stats.startNetWorth = os.clock(), 0, nil
+	Stats.since = os.date("%d %b %Y, %H:%M")
+	Stats.save()
+end
 
 -- Two locks keep features from racing each other:
 --   body  - anything that moves your character or car (auctions, pickup,
@@ -1398,18 +1487,41 @@ end
 -- Auction: bidding
 ---------------------------------------------------------------------------
 
+-- A gavel in the lot. The game marks it in several ways (its own auction code
+-- reads the Gavel* attributes on the garage and items); the outline can be
+-- missing while the lot is checked, so look at all of them.
+local TROPHY_ID = "376"
+do
+	local okT, TrophyCfg = pcall(require, Modules:FindFirstChild("TrophyConfig"))
+	if okT and type(TrophyCfg) == "table" and TrophyCfg.TrophyItemId then TROPHY_ID = tostring(TrophyCfg.TrophyItemId) end
+end
+local function isGavelModel(m)
+	if m:GetAttribute("IsTrophy") == true or m:GetAttribute("TrophyUid") ~= nil then return true end
+	if tostring(m:GetAttribute("ItemId")) == TROPHY_ID then return true end
+	if m:GetAttribute("GavelForcedMutator") or m:GetAttribute("GavelAssistMutator") then return true end
+	if m.Name:find("Gavel", 1, true) then return true end
+	-- the item reveal may already have named a hidden item
+	local R = env.UAIAuctionReveal
+	local rec = R and type(R.items) == "table" and R.items[m]
+	return rec ~= nil and type(rec.guess) == "string" and rec.guess:find("Gavel", 1, true) ~= nil
+end
+
 local function scanLotForBlue()
 	local g = A.garage
 	local floor = g and g:FindFirstChild("Floorspace")
-	local found = false
+	local found, gavel = false, false
+	if g and (g:GetAttribute("GavelForcedMutator") or g:GetAttribute("GavelAssistMutator")) then gavel = true end
 	for _, m in ipairs(floor and floor:GetChildren() or {}) do
 		if m:IsA("Model") then
 			local spot = m:GetAttribute("SpotOutline")
 			if spot == true or spot == LP.UserId then spotted[m] = true end
 			if spotted[m] or m:GetAttribute("PlayAuraSound") == true then found = true end
+			if isGavelModel(m) then gavel = true; spotted[m] = true end
 		end
 	end
-	A.hasBlue = found
+	A.hasGavel = gavel
+	-- a gavel counts as an outlined item: always taken, bid on despite lot value
+	A.hasBlue = found or (gavel and S.gavelLots ~= false)
 end
 
 -- Lot filter: before bidding, require a minimum starting bid and/or at least
@@ -1461,9 +1573,19 @@ local function checkLot()
 		A.filter, A.filterWhy = "pass", "airdrop crate"
 		return
 	end
-	-- 1. an outlined (blue) item: take this lot, skip the other checks
+	-- 1. an outlined item or a gavel: take this lot, skip the other checks
 	scanLotForBlue()
-	if A.hasBlue then A.filter, A.filterWhy = "pass", "outlined item in the lot"; return end
+	if A.hasBlue then
+		A.filter, A.filterWhy = "pass", A.hasGavel and "gavel in the lot" or "outlined item in the lot"
+		return
+	end
+	-- a hidden item could still turn out to be a gavel: while the item reveal
+	-- is reading this lot, hold off rejecting it (up to 15 s after it opened)
+	local R = env.UAIAuctionReveal
+	if R and type(R.garageSummary) == "function" and now - A.openedAt < 15 then
+		local okSum, sum = pcall(R.garageSummary, A.garage)
+		if okSum and type(sum) == "table" and (sum.pending or 0) > 0 then return end
+	end
 	-- wait until the floor items have arrived and settled (outlines can follow a moment later)
 	local n = floorItemCount()
 	if n == 0 then
@@ -1532,7 +1654,11 @@ local function bidTick(now)
 	end
 	if limit > 0 and price > limit then A.status = "Next bid " .. money(price) .. " is over the max"; return end
 	local cash = LP:GetAttribute("Cash")
-	if type(cash) == "number" and price > cash - S.keepCash then A.status = "Not enough cash for " .. money(price); return end
+	if type(cash) == "number" and price > cash - S.keepCash then
+		A.status = "Not enough cash for " .. money(price)
+		A.cashShort = true -- after this auction, wait at the plot for sales
+		return
+	end
 	if now - A.lastBid < A.wait then return end
 	A.lastBid = now
 	A.wait = S.bidDelay + math.random() * 0.15
@@ -1978,6 +2104,22 @@ local function keepRulesActive()
 end
 
 local function matchesKeepRule(def, e, sets)
+	-- Gavels follow only the Gavel rule, so its mutation filter cannot be
+	-- bypassed by "Always keep" or the gear rules.
+	if isGavel(def) then
+		if not S.favGavel then return false end
+		-- A gavel's mutations carry a luck value (0.35 = the 35% shown on the
+		-- gavel). Keep it when one picked mutation (or any, if none are picked)
+		-- is at least the minimum %.
+		local minPct = tonumber(S.favGavelPct) or 0
+		if next(sets.gavelMut) == nil and minPct <= 0 then return true end
+		for _, m in ipairs(type(e.Mutators) == "table" and e.Mutators or {}) do
+			if type(m) == "table" and m.name and (next(sets.gavelMut) == nil or sets.gavelMut[m.name]) then
+				if minPct <= 0 or (tonumber(m.luck) or 0) * 100 >= minPct then return true end
+			end
+		end
+		return false
+	end
 	if sets.item[def.Name] then return true end
 	if isGear(def, e) then
 		if S.favGearMin > 0 and entryValue(e) >= S.favGearMin then return true end
@@ -1994,7 +2136,9 @@ local function keepRulesText()
 	if S.favGearMin > 0 then parts[#parts + 1] = "gear worth " .. money(S.favGearMin) .. "+" end
 	if #(S.favGearMuts or {}) > 0 then parts[#parts + 1] = "gear with " .. table.concat(S.favGearMuts, " or ") end
 	if S.favGavel then
-		parts[#parts + 1] = #(S.favGavelMuts or {}) > 0 and ("gavels with " .. table.concat(S.favGavelMuts, " or ")) or "all gavels"
+		local pct = tonumber(S.favGavelPct) or 0
+		local which = #(S.favGavelMuts or {}) > 0 and table.concat(S.favGavelMuts, " or ") or (pct > 0 and "any mutation" or nil)
+		parts[#parts + 1] = which and ("gavels with " .. which .. (pct > 0 and (" at " .. pct .. "%+") or "")) or "all gavels"
 	end
 	if #(S.favItems or {}) > 0 then parts[#parts + 1] = #S.favItems .. " always-keep item(s)" end
 	return #parts > 0 and table.concat(parts, ", ") or "No keep rules set"
@@ -2681,6 +2825,10 @@ local auctionInfo = auction:Info("Waiting for auction")
 auction:Number({ Id = "maxBid", Text = "Max bid", Hint = "0 = no limit", Default = D("maxBid", 0), Min = 0, Prefix = "$" })
 auction:Number({ Id = "blueMaxBid", Text = "Max bid if outlined item", Hint = "Ignores lot value; 0 = same as max bid", Default = D("blueMaxBid", 0), Min = 0, Prefix = "$" })
 auction:Number({ Id = "keepCash", Text = "Always keep cash", Hint = "Never spends below this", Default = D("keepCash", 0), Min = 0, Prefix = "$" })
+auction:Section("When cash runs low")
+auction:Toggle({ Id = "lowCashPause", Text = "Wait at plot for sales", Hint = "Pauses new auctions until shelf sales come in", Default = D("lowCashPause", true) })
+auction:Number({ Id = "lowCashAt", Text = "Low cash below", Hint = "Also kicks in if you could not afford a bid", Default = D("lowCashAt", 1000), Min = 0, Prefix = "$" })
+auction:Number({ Id = "lowCashCooldown", Text = "Cooldown", Hint = "Repeats while cash stays low", Default = D("lowCashCooldown", 90), Min = 30, Max = 600, Suffix = "s" })
 auction:Section("Where to go")
 auction:List({ Id = "areas", Text = "Areas", Hint = "None picked = all areas", Multi = true, Options = areaNames, Default = D("areas", {}), Empty = "All" })
 auction:Choice({ Id = "garagePick", Text = "Which garage first", Options = { "Nearest", "Cheapest", "Priciest" }, Default = D("garagePick", "Nearest") })
@@ -2688,6 +2836,7 @@ auction:Number({ Id = "maxEntry", Text = "Max entry fee", Hint = "0 = any", Defa
 auction:Toggle({ Id = "bringCar", Text = "Bring my car", Hint = "Parks it by the garage so loot loads fast", Default = D("bringCar", false) })
 auction:Section("Skip bad lots")
 auction:Toggle({ Id = "lotFilter", Text = "Check lots first", Hint = "Outlined items and airdrops always pass", Default = D("lotFilter", false) })
+auction:Toggle({ Id = "gavelLots", Text = "Gavel lots always pass", Hint = "Bids on any lot with a gavel, ignoring the checks", Default = D("gavelLots", true) })
 auction:List({ Id = "lotMuts", Text = "Must have a mutation", Hint = "Any one of these", Multi = true, Options = mutationNames, Default = D("lotMuts", {}), Empty = "Any" })
 auction:Number({ Id = "minStartBid", Text = "Starting bid at least", Hint = "0 = any", Default = D("minStartBid", 0), Min = 0, Prefix = "$" })
 auction:Section("See hidden items")
@@ -2724,7 +2873,13 @@ loot:Number({ Id = "favGearMin", Text = "Gear worth at least", Hint = "Wearables
 loot:List({ Id = "favGearMuts", Text = "Gear with a mutation", Hint = "At any price", Multi = true, Options = mutationNames, Default = D("favGearMuts", {}), Empty = "None" })
 loot:Toggle({ Id = "favGavel", Text = "Gavel trophies", Default = D("favGavel", false) })
 loot:List({ Id = "favGavelMuts", Text = "Gavel mutations", Hint = "None picked = every gavel", Multi = true, Options = mutationNames, Default = D("favGavelMuts", {}), Empty = "Any" })
-loot:List({ Id = "favItems", Text = "Always keep these items", Hint = "At any value", Multi = true, Options = itemNames, Default = D("favItems", {}), Empty = "None" })
+loot:Number({ Id = "favGavelPct", Text = "Gavel mutation at least", Hint = "The % shown on the gavel; 0 = off", Default = D("favGavelPct", 0), Min = 0, Max = 1000, Suffix = "%" })
+do -- gavels are handled only by the Gavel rule above, so they are not offered here
+	local keepNames, keepSaved = {}, {}
+	for _, name in ipairs(itemNames) do if not name:find("Gavel", 1, true) then keepNames[#keepNames + 1] = name end end
+	for _, name in ipairs(D("favItems", {})) do if not name:find("Gavel", 1, true) then keepSaved[#keepSaved + 1] = name end end
+	loot:List({ Id = "favItems", Text = "Always keep these items", Hint = "At any value (gavels use the Gavel rule)", Multi = true, Options = keepNames, Default = keepSaved, Empty = "None" })
+end
 loot:Actions({ { Text = "Favorite matching items now", Callback = favoriteNow } })
 loot:Section("Safes and vaults")
 loot:Toggle({ Id = "safeLocksmith", Text = "Use the Locksmith too", Hint = "For safes your lockpick is not good enough for", Default = D("safeLocksmith", true) })
@@ -2735,9 +2890,10 @@ loot:Actions({ { Text = "Open safes now", Callback = function() runItems("open s
 -- Stats: what the hub did this session.
 ---------------------------------------------------------------------------
 local statsTab = ui:Tab("Stats")
-statsTab:Section("Session")
+statsTab:Section("Overview")
 local statRows = {
-	time = statsTab:Stat("Running for"),
+	since = statsTab:Stat("Counting since"),
+	time = statsTab:Stat("Time with the hub"),
 	worthStart = statsTab:Stat("Net worth at start"),
 	worthNow = statsTab:Stat("Net worth now"),
 	worthGain = statsTab:Stat("Net worth gained"),
@@ -2758,10 +2914,10 @@ statRows.sales = statsTab:Stat("Shelf sales")
 statsTab:Section("Money handled")
 statRows.handled = statsTab:Stat("Total moved by the hub")
 statsTab:Actions({ { Text = "Reset stats", Callback = function()
-	Stats.startedAt, Stats.startNetWorth = os.clock(), nil
-	Stats.won, Stats.bidsPaid, Stats.entryFees, Stats.lootValue = 0, 0, 0, 0
-	Stats.mutated, Stats.safes, Stats.shelfSales, Stats.salesCount = 0, 0, 0, 0
-	Auto.joined, Auto.picked, Auto.favorited, Auto.listed = 0, 0, 0, 0
+	ui:Confirm({
+		Title = "Reset all stats?", Text = "Every counter goes back to zero and counting starts again from now.",
+		Confirm = "Reset", Danger = true, Callback = Stats.reset,
+	})
 end } })
 
 ---------------------------------------------------------------------------
@@ -2863,7 +3019,37 @@ local function applyTheme()
 end
 Hub.applyTheme = applyTheme
 playerTab:Section("Keybinds")
-playerTab:Info("Click the small box next to any switch, then press a key. Backspace clears it. Insert shows or hides this window.")
+playerTab:Toggle({ Id = "keybindNotify", Text = "Keybind notifications", Hint = "Shows ON or OFF when a key flips a switch", Default = D("keybindNotify", true) })
+playerTab:Info("Click the small box next to any switch, then press a key. Give several switches the same key and it toggles them together (all on, or all off if they already are); shared keys show a *. Backspace clears. Insert shows or hides this window.")
+
+-- One-time move from the old "keybind groups": each group's switches take its key.
+do
+	local binds = ui:_binds()
+	local byLabel = {}
+	for id, sw in pairs(ui.switches) do
+		if sw.isSwitch then byLabel[(sw.tab and (sw.tab .. ": ") or "") .. sw.text] = id end
+	end
+	local moved = false
+	for n = 1, 3 do
+		local groupId = "group" .. n
+		for keyName, ids in pairs(binds) do
+			for i = #ids, 1, -1 do
+				if ids[i] == groupId then
+					table.remove(ids, i)
+					for _, labelText in ipairs(S["keyGroup" .. n] or {}) do
+						local id = byLabel[labelText]
+						if id and not table.find(ids, id) then table.insert(ids, id) end
+					end
+					moved = true
+				end
+			end
+			if #ids == 0 then binds[keyName] = nil end
+		end
+		S["keyGroup" .. n] = nil
+	end
+	if moved then queueSave() end
+	ui:_paintChips()
+end
 playerTab:Section("Hub")
 playerTab:Actions({ { Text = "Unload script", Callback = unloadScript } })
 S.tpPlace, S.tpPlayer = nil, nil -- not worth remembering between sessions
@@ -2872,7 +3058,8 @@ placePick.Set(nil, false)
 -- Live lines on Home: what each step is set to, and which one is working.
 local function refreshHome()
 	local areas = #(S.areas or {}) > 0 and table.concat(S.areas, ", ") or "All areas"
-	steps.find.SetDetail(Auto.dumping and "Paused while unloading" or (areas .. ", " .. string.lower(S.garagePick or "nearest") .. " first"))
+	steps.find.SetDetail(Auto.cooldownUntil and "Low cash: waiting at plot for sales"
+		or (Auto.dumping and "Paused while unloading" or (areas .. ", " .. string.lower(S.garagePick or "nearest") .. " first")))
 	steps.bid.SetDetail((S.maxBid > 0 and ("Up to " .. money(S.maxBid)) or "No max bid") .. (S.lotFilter and ", checks lots" or ""))
 	local take = "Worth " .. money(S.minTake) .. "+"
 	if S.takeBlue then take ..= ", outlined" end
@@ -2903,8 +3090,10 @@ local function refreshHome()
 	local worth = netWorth()
 	if worth == math.huge then worth = nil end
 	if not Stats.startNetWorth and worth then Stats.startNetWorth = worth end
-	local secs = math.floor(os.clock() - Stats.startedAt)
+	local secs = math.floor(Stats.trackedSeconds())
+	statRows.since(Stats.since)
 	statRows.time(string.format("%d:%02d:%02d", secs // 3600, (secs % 3600) // 60, secs % 60))
+	if os.clock() - (Stats.savedAt or 0) > 30 then Stats.savedAt = os.clock(); Stats.save() end
 	statRows.worthStart(Stats.startNetWorth and money(Stats.startNetWorth) or "-")
 	statRows.worthNow(worth and money(worth) or "-")
 	statRows.worthGain((worth and Stats.startNetWorth) and ((worth >= Stats.startNetWorth and "+" or "") .. money(worth - Stats.startNetWorth)) or "-")
@@ -2967,6 +3156,8 @@ on(Rm.ToggleBiddingUI and Rm.ToggleBiddingUI.OnClientEvent, function(open)
 		beginLotCheck(A.garage) -- no-op if the check already started in the zone
 		scanLotForBlue()
 	else
+		if A.cashShort then Auto.cashShortAfter = true end
+		A.cashShort = false
 		A.garage, A.hasBlue, A.startBid, A.filterGarage, A.filter = nil, false, nil, nil, nil
 		-- after a lot we left on purpose, go straight on; otherwise wait for results
 		if os.clock() - (Auto.leftAt or 0) > 10 then Auto.lastAuctionEnd = os.clock() end
@@ -3128,6 +3319,36 @@ local function autoStep()
 		high = vehicleFull({}) or cargoPct() >= S.dumpAt
 	end
 	Auto.phase = "find"
+	-- Low cash: wait at the plot for shelf sales instead of opening auctions.
+	-- Resume as soon as sales bring the cash back; otherwise the cooldown repeats.
+	if S.lowCashPause and (S.autoAuction or S.autoAirdrop) then
+		local cash = tonumber(LP:GetAttribute("Cash")) or 0
+		local low = cash < S.lowCashAt or Auto.cashShortAfter
+		if low and not Auto.cooldownUntil then
+			Auto.cooldownUntil = now + S.lowCashCooldown
+			Auto.cooldownMark = cash
+			Auto.cooldownPlotSent = false
+		end
+		if Auto.cooldownUntil then
+			local recovered = cash >= S.lowCashAt and cash > Auto.cooldownMark
+			if recovered then
+				Auto.cooldownUntil, Auto.cashShortAfter = nil, false
+				Auto.status = "Sales came in (" .. money(cash) .. "), back to auctions"
+			else
+				if not Auto.cooldownPlotSent and Rm.TeleportToPlot then
+					Auto.cooldownPlotSent = true
+					Rm.TeleportToPlot:FireServer()
+				end
+				if now >= Auto.cooldownUntil then
+					Auto.cooldownUntil = now + S.lowCashCooldown -- still short: wait another round
+				end
+				local left = math.max(0, math.floor(Auto.cooldownUntil - now))
+				Auto.status = string.format("Low cash (%s): waiting at plot for sales, %d:%02d%s", money(cash), left // 60, left % 60,
+					S.autoList and "" or " (turn on Sell on shelves)")
+				return
+			end
+		end
+	end
 	-- airdrop crates vanish after 10 minutes, so they go before normal auctions
 	if S.autoAirdrop and not high and airdropEligible() and nextAirdrop() then
 		openAirdrop()
@@ -3249,6 +3470,7 @@ function Hub.stop()
 	-- if an admin pause switched features off, save them as you had them
 	for k in pairs(Safety.snapshot or {}) do S[k] = true end
 	pcall(function() writefile(SETTINGS_PATH, HttpService:JSONEncode(S)) end)
+	Stats.save()
 	local R = env.UAIAuctionReveal
 	if R and R.headless and R.stop then pcall(R.stop) end
 	pcall(function() markerFolder:Destroy() end)
@@ -3259,6 +3481,10 @@ end
 Hub.S, Hub.A, Hub.Auto, Hub.ui = S, A, Auto, ui
 Hub.quickBar = quickBar
 Hub.checkStaff = checkStaff
+Hub.wouldKeep = function(entry) -- for testing keep rules on an inventory entry
+	local def = Items[tostring(entry.ItemId)]
+	return def ~= nil and matchesKeepRule(def, entry, keepSets())
+end
 Hub.Safety = Safety
 applyTheme() -- saved theme, applied once everything is built
 checkStaff() -- now that every switch exists, pause at once if an admin is already here
