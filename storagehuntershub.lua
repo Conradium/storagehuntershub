@@ -1,12 +1,12 @@
--- Storage Hunters Hub 2.8.1 (Storage Hunters: Open World)
+-- Storage Hunters Hub 3.6 (Storage Hunters: Open World)
 -- Made by conradium, commissioned by rsl.
--- Auto bid, auto open auctions, take/open/repair won items, favorites,
--- shelf listing, offers, teleports and movement. Settings are saved.
+-- Auto bid, auto open auctions and airdrops, take/open/repair won items, favorites,
+-- shelf listing, teleports and movement. Settings are saved.
 -- Toggle the window with Right Ctrl. Stop: getgenv().SHHub.stop()
 
 local env = getgenv()
 if env.SHHub and type(env.SHHub.stop) == "function" then pcall(env.SHHub.stop) end
-local Hub = { alive = true, version = "2.8.1" }
+local Hub = { alive = true, version = "3.6.0" }
 env.SHHub = Hub
 ---------------------------------------------------------------------------
 -- Compact UI kit (custom, requested for this hub)
@@ -193,6 +193,23 @@ function Kit:Bar(items)
 		end)
 	end
 	return bar
+end
+
+-- A short notice under the top bar; a newer one replaces the older.
+function Kit:Toast(text, seconds)
+	if not self.alive then return end
+	if self.toast then self.toast:Destroy() end
+	local t = new("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 132),
+		Size = UDim2.fromOffset(0, 36), AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = C.bg, BackgroundTransparency = 0.04, BorderSizePixel = 0,
+		Text = text, TextSize = 14, Font = FONT_BOLD, TextColor3 = C.text,
+	}, self.gui)
+	corner(t, 10)
+	stroke(t, C.accent)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16) }, t)
+	self.toast = t
+	task.delay(seconds or 6, function() if t.Parent then t:Destroy() end end)
 end
 
 -- Keybinds: values.keybinds maps a KeyCode name to a switch Id.
@@ -648,10 +665,6 @@ local Rm = {
 	GetMyPlacedItems = remote("Plot", "GetMyPlacedItems"),
 	ChangeStockPrice = remote("Plot", "ChangeStockPrice"),
 	RequestPlotData = remote("Plot", "RequestPlotData"),
-	ShowOffer = remote("NPCShopper", "ShowOffer"),
-	OfferPresented = remote("NPCShopper", "OfferPresented"),
-	RespondOffer = remote("NPCShopper", "RespondOffer"),
-	HideOffer = remote("NPCShopper", "HideOffer"),
 	CashEffect = remote("NPCShopper", "CashEffect"),
 	TeleportToPlot = remote("Plot", "TeleportToPlot"),
 	RequestSpawn = remote("Vehicles", "RequestSpawn"),
@@ -757,6 +770,34 @@ local Auto = { status = "Idle", busy = false, lastStep = 0, lastAuctionEnd = 0, 
 	blocked = {}, pickFail = {}, repairTried = {}, veh = nil, plot = nil, plotAt = 0, basePrice = {}, priced = {},
 	picked = 0, opened = 0, repaired = 0, favorited = 0, listed = 0, accepted = 0, joined = 0 }
 local spotted = setmetatable({}, { __mode = "k" })
+
+-- Two locks keep features from racing each other:
+--   body  - anything that moves your character or car (auctions, pickup,
+--           boxes, unload trips, teleports)
+--   items - anything that changes your inventory or shelves (favorite,
+--           list, unload into inventory, repair shop)
+-- Every automation and every button takes the lock it needs and waits its
+-- turn. Work that needs both always takes body first, so it cannot deadlock.
+-- Bidding and the reveal touch neither and stay independent.
+-- (Luau tasks only switch at yields, so the check-and-take below is atomic.)
+local Locks = { body = { name = "body" }, items = { name = "items" } }
+local function guarded(lock, who, fn, ...)
+	local t0 = os.clock()
+	while lock.owner do
+		if not Hub.alive then return false, "hub stopped" end
+		if os.clock() - t0 > 60 then return false, lock.owner .. " is still running" end
+		task.wait(0.05)
+	end
+	lock.owner = who
+	if lock == Locks.body then Auto.busy = true end
+	local result = table.pack(pcall(fn, ...))
+	lock.owner = nil
+	if lock == Locks.body then Auto.busy = false end
+	if not result[1] then return false, result[2] end
+	return true, table.unpack(result, 2, result.n)
+end
+local function runBody(who, fn, ...) return guarded(Locks.body, who, fn, ...) end
+local function runItems(who, fn, ...) return guarded(Locks.items, who, fn, ...) end
 
 -- "Blue" items: the game outlines them for everyone (event bonus) or for
 -- you (your bonus item, e.g. a trophy with an aura).
@@ -977,39 +1018,80 @@ local function lotMutations()
 	return found
 end
 
+-- Leave a rejected lot and move straight on: no waiting for the auctioneer,
+-- the countdown or the results pause.
 local function failLot(reason)
 	A.filter, A.filterWhy = "fail", reason
 	if not S.leaveFailed then return end
 	local key = A.garage and (A.garage:GetAttribute("GUID") or A.garage:GetFullName())
 	if key then Auto.blocked[key] = os.clock() + 300 end
 	Auto.leftAt = os.clock()
-	task.spawn(invoke, Rm.LeaveAuction)
+	Auto.status = "Lot skipped: " .. reason .. "; moving on"
+	task.spawn(function()
+		invoke(Rm.LeaveAuction)
+		A.active, A.garage, A.hasBlue, A.startBid, A.filterGarage = false, nil, false, nil, nil
+		Auto.lastAuctionEnd, Auto.lastJoin = 0, 0 -- the next garage can open right away
+	end)
 end
 
+local function floorItemCount()
+	local floor = A.garage and A.garage:FindFirstChild("Floorspace")
+	local n = 0
+	for _, m in ipairs(floor and floor:GetChildren() or {}) do if m:IsA("Model") then n += 1 end end
+	return n
+end
+
+-- Decides as early as possible. Starts when you enter the auction zone, so
+-- the floor items are judged during the countdown, before bidding opens.
 local function checkLot()
-	local since = os.clock() - A.openedAt
-	if since < 1.5 then return end -- let the floor items and starting bid arrive
-	if S.minStartBid > 0 then
-		if not A.startBid then
-			if since < 6 then return end
-			return failLot("starting bid unknown")
-		end
-		if A.startBid < S.minStartBid then
-			return failLot(string.format("starting bid %s is under %s", money(A.startBid), money(S.minStartBid)))
-		end
+	local now = os.clock()
+	-- 0. airdrop crates are special drops: always bid
+	if A.garage and A.garage:GetAttribute("GarageId") == "Camo Airdrop" then
+		A.filter, A.filterWhy = "pass", "airdrop crate"
+		return
 	end
+	-- 1. an outlined (blue) item: take this lot, skip the other checks
+	scanLotForBlue()
+	if A.hasBlue then A.filter, A.filterWhy = "pass", "outlined item in the lot"; return end
+	-- wait until the floor items have arrived and settled (outlines can follow a moment later)
+	local n = floorItemCount()
+	if n == 0 then
+		if now - A.openedAt < 4 then return end
+	elseif n ~= A.floorCount then
+		A.floorCount, A.floorSeenAt = n, now
+		return
+	elseif now - (A.floorSeenAt or now) < 0.8 then
+		return
+	end
+	-- 2. mutations are known as soon as the items are
 	local wanted = S.lotMuts or {}
 	if #wanted > 0 then
 		local found = lotMutations()
 		local hit
 		for _, name in ipairs(wanted) do if found[name] then hit = name; break end end
-		if not hit then
-			if since < 4 then return end
-			return failLot("no wanted mutation in the lot")
-		end
+		if not hit then return failLot("no wanted mutation in the lot") end
 		A.filterWhy = "has " .. hit
 	end
+	-- 3. the starting bid is only announced when bidding begins
+	if S.minStartBid > 0 then
+		if not A.startBid then
+			if now - A.openedAt < 20 then return end
+			return failLot("starting bid never announced")
+		end
+		if A.startBid < S.minStartBid then
+			return failLot(string.format("starting bid %s is under %s", money(A.startBid), money(S.minStartBid)))
+		end
+	end
 	A.filter = "pass"
+end
+
+-- Starts a lot check for a garage once, when it is first seen.
+local function beginLotCheck(garage)
+	if not garage or A.filterGarage == garage then return end
+	A.filterGarage = garage
+	A.filter = S.lotFilter and "checking" or "off"
+	A.filterWhy, A.startBid, A.floorCount, A.floorSeenAt = nil, nil, nil, nil
+	A.openedAt = os.clock()
 end
 
 local function bidTick(now)
@@ -1017,20 +1099,26 @@ local function bidTick(now)
 		A.status = A.active and "Auction open, auto bid off" or "Waiting for auction"
 		return
 	end
-	if A.filter == "checking" then
-		checkLot()
-		if A.filter == "checking" then A.status = "Checking the lot before bidding"; return end
+	if A.filter == "checking" or (S.lotFilter and A.filter == nil) then
+		A.status = "Checking the lot before bidding"
+		return
 	end
 	if A.filter == "fail" then A.status = "Lot skipped: " .. tostring(A.filterWhy); return end
 	if A.paused then A.status = "Auction paused"; return end
 	if A.winner == LP.Name then A.status = "Winning at " .. money(A.amount); return end
 	local price = A.nextPrice or A.amount or 0
-	local limit = S.maxBid
-	if S.bidPctOfValue > 0 and A.lotEst then
-		local cap = A.lotEst * S.bidPctOfValue / 100
-		limit = limit > 0 and math.min(limit, cap) or cap
+	local limit
+	if A.hasBlue then
+		-- an outlined item: bid despite a low lot value; only the outlined max
+		-- (or your normal max when that is 0) limits it
+		limit = S.blueMaxBid > 0 and S.blueMaxBid or S.maxBid
+	else
+		limit = S.maxBid
+		if S.bidPctOfValue > 0 and A.lotEst then
+			local cap = A.lotEst * S.bidPctOfValue / 100
+			limit = limit > 0 and math.min(limit, cap) or cap
+		end
 	end
-	if A.hasBlue and S.blueMaxBid > 0 then limit = math.max(limit, S.blueMaxBid) end
 	if limit > 0 and price > limit then A.status = "Next bid " .. money(price) .. " is over the max"; return end
 	local cash = LP:GetAttribute("Cash")
 	if type(cash) == "number" and price > cash - S.keepCash then A.status = "Not enough cash for " .. money(price); return end
@@ -1088,19 +1176,24 @@ local function garageCandidates()
 	return out
 end
 
-local function joinAuction()
-	local c = garageCandidates()[1]
-	if not c then Auto.status = "No garage matches your auction filters"; return false end
-	local g = c.garage
+-- Walks up to a garage's Start Auction prompt and opens it. Shared by normal
+-- auctions and airdrops. Returns true once the auction has started.
+local function openGarage(g, key, label)
 	Auto.lastJoin = os.clock()
-	Auto.status = string.format("Opening %s (%s, %s)", tostring(g:GetAttribute("GarageId") or g.Name), c.area, money(c.cost))
 	pcall(LP.RequestStreamAroundAsync, LP, g:GetPivot().Position, 3)
 	local square = g:FindFirstChild("EntrySquare")
 	local part = square and square:FindFirstChild("PromptPart")
 	local prompt = part and part:FindFirstChild("EnterAuction")
 	if not prompt then
-		Auto.blocked[c.key] = os.clock() + 30
-		Auto.status = "Garage entrance not loaded yet, trying another"
+		-- not every garage keeps it under EntrySquare (airdrop crates may not)
+		prompt = g:FindFirstChild("EnterAuction", true)
+		part = prompt and prompt.Parent
+		if part and part:IsA("Attachment") then part = part.Parent end
+		if part and not part:IsA("BasePart") then part = nil end
+	end
+	if not (prompt and part) then
+		Auto.blocked[key] = os.clock() + 30
+		Auto.status = label .. ": entrance not loaded yet, trying another"
 		return false
 	end
 	if S.bringCar then
@@ -1118,11 +1211,111 @@ local function joinAuction()
 	local t0 = os.clock()
 	while os.clock() - t0 < 10 do
 		if A.active then Auto.joined += 1; return true end
+		-- rejected by the lot filter during the countdown: it opened, move on
+		if (Auto.leftAt or 0) > t0 then Auto.joined += 1; return true end
 		task.wait(0.25)
 	end
-	Auto.blocked[c.key] = os.clock() + 120
-	Auto.status = "Could not open " .. tostring(g:GetAttribute("GarageId") or g.Name) .. ", skipping it for 2 min"
+	Auto.blocked[key] = os.clock() + 120
+	Auto.status = "Could not open " .. label .. ", skipping it for 2 min"
 	return false
+end
+
+local function joinAuction()
+	local c = garageCandidates()[1]
+	if not c then Auto.status = "No garage matches your auction filters"; return false end
+	local g = c.garage
+	local label = tostring(g:GetAttribute("GarageId") or g.Name)
+	Auto.status = string.format("Opening %s (%s, %s)", label, c.area, money(c.cost))
+	return openGarage(g, c.key, label)
+end
+
+---------------------------------------------------------------------------
+-- Airdrops (Military Airdrop event)
+---------------------------------------------------------------------------
+-- During the event a plane drops "Camo Airdrop" crates onto pads. Each crate
+-- is a small auction lot (3 items, $2,000 entry) that needs $80M net worth and
+-- disappears 10 minutes after landing. Crates carry the "MilitaryAirdrop"
+-- tag and attributes AirdropState ("falling"/"landed") and AirdropExpiresAt.
+local okAirCfg, AirCfg = pcall(require, Modules:FindFirstChild("MilitaryAirdropConfig"))
+if not okAirCfg or type(AirCfg) ~= "table" then AirCfg = {} end
+local AIR_TAG = AirCfg.Tag or "MilitaryAirdrop"
+local AIR_GARAGE = AirCfg.GarageId or "Camo Airdrop"
+local AIR_ATTR = type(AirCfg.Attributes) == "table" and AirCfg.Attributes or {}
+local AIR_STATE = AIR_ATTR.State or "AirdropState"
+local AIR_EXPIRES = AIR_ATTR.ExpiresAt or "AirdropExpiresAt"
+local airDef = okGarages and type(GarageDefs) == "table" and GarageDefs[AIR_GARAGE] or {}
+local AIR_MIN_WORTH = tonumber(airDef.MinNetWorth) or 0
+local AIR_FEE = type(airDef.EntryCost) == "table" and tonumber(airDef.EntryCost.Max or airDef.EntryCost.Min) or 0
+local CollectionService = game:GetService("CollectionService")
+
+local function airdropTimeLeft(inst)
+	local expires = tonumber(inst:GetAttribute(AIR_EXPIRES))
+	return expires and (expires - workspace:GetServerTimeNow()) or nil
+end
+
+-- The garage you open for a crate: the tagged instance itself when it has a
+-- Start Auction prompt, otherwise the nearest Camo Airdrop garage.
+local function airdropGarage(inst)
+	if inst:FindFirstChild("EnterAuction", true) then return inst end
+	local root = workspace:FindFirstChild("_Debris") and workspace._Debris:FindFirstChild("Garages")
+	local okPos, pivot = pcall(function() return inst:IsA("BasePart") and inst.CFrame or inst:GetPivot() end)
+	local pos = okPos and pivot and pivot.Position
+	local best, bestD
+	for _, g in ipairs(root and root:GetChildren() or {}) do
+		if g:GetAttribute("GarageId") == AIR_GARAGE and pos then
+			local d = (g:GetPivot().Position - pos).Magnitude
+			if d < 80 and (not bestD or d < bestD) then best, bestD = g, d end
+		end
+	end
+	return best
+end
+
+local function airdropSummary()
+	local falling, landed, nearest = 0, 0, nil
+	for _, inst in ipairs(CollectionService:GetTagged(AIR_TAG)) do
+		local state = inst:GetAttribute(AIR_STATE)
+		if state == "falling" then falling += 1
+		elseif state == "landed" then
+			landed += 1
+			local left = airdropTimeLeft(inst)
+			if left and (not nearest or left < nearest) then nearest = left end
+		end
+	end
+	return falling, landed, nearest
+end
+
+local function airdropEligible()
+	if netWorth() < AIR_MIN_WORTH then
+		return false, string.format("needs %s net worth, you have %s", money(AIR_MIN_WORTH), money(netWorth()))
+	end
+	local cash = tonumber(LP:GetAttribute("Cash")) or 0
+	if cash - AIR_FEE < S.keepCash then return false, "not enough cash for the " .. money(AIR_FEE) .. " entry" end
+	return true
+end
+
+-- Picks the landed crate to open: not in an auction, not about to vanish, nearest first.
+local function nextAirdrop()
+	local _, hrp = getChar()
+	local best, bestD
+	for _, inst in ipairs(CollectionService:GetTagged(AIR_TAG)) do
+		local left = airdropTimeLeft(inst)
+		local g = inst:GetAttribute(AIR_STATE) == "landed" and (left or 0) > 25 and airdropGarage(inst)
+		local key = g and ("airdrop:" .. (g:GetAttribute("GUID") or g:GetFullName()))
+		if g and not g:GetAttribute("InAuction") and (Auto.blocked[key] or 0) < os.clock() then
+			local d = hrp and (g:GetPivot().Position - hrp.Position).Magnitude or 0
+			if not bestD or d < bestD then best, bestD = { garage = g, key = key }, d end
+		end
+	end
+	return best
+end
+
+local function openAirdrop()
+	local ok, why = airdropEligible()
+	if not ok then Auto.status = "Airdrop landed, but opening " .. why; return false end
+	local d = nextAirdrop()
+	if not d then return false end
+	Auto.status = "Opening an airdrop crate"
+	return openGarage(d.garage, d.key, "airdrop crate")
 end
 
 ---------------------------------------------------------------------------
@@ -1181,8 +1374,20 @@ local function takeable()
 			local entry = modelEntry(m)
 			local value = entryValue(entry)
 			local blue = isBlue(m)
-			if (blue and S.takeBlue) or value >= S.minTake then
-				local def = Items[tostring(entry.ItemId)]
+			local mutated = false
+			if #(S.takeMuts or {}) > 0 then
+				local want = {}
+				for _, n in ipairs(S.takeMuts) do want[n] = true end
+				for _, mu in ipairs(entry.Mutators) do
+					if type(mu) == "table" and want[mu.name] then mutated = true; break end
+				end
+			end
+			local def = Items[tostring(entry.ItemId)]
+			local named = false
+			if def and #(S.takeNames or {}) > 0 then
+				for _, n in ipairs(S.takeNames) do if n == def.Name then named = true; break end end
+			end
+			if (blue and S.takeBlue) or mutated or named or value >= S.minTake then
 				list[#list + 1] = { model = m, prompt = prompt, part = part, value = value, blue = blue, entry = entry,
 					rank = RARITY_RANK[def and def.Rarity or ""] or 0,
 					weight = tonumber(m:GetAttribute("Weight")) or 0 }
@@ -1240,7 +1445,7 @@ local function takeItems(items)
 		if it.prompt.Parent and it.prompt.Enabled then
 			local w, lim = cargoOf(veh)
 			if not (lim and lim > 0 and w + it.weight > lim + 1e-3) then
-				Auto.status = string.format("Taking %s%s (%d/%d)", it.model.Name, it.blue and " [blue]" or "", i, #items)
+				Auto.status = string.format("Taking %s%s (%d/%d)", it.model.Name, it.blue and " [outlined]" or "", i, #items)
 				placeNear(it.part.Position)
 				task.wait(0.2)
 				tryWrench(it)
@@ -1323,24 +1528,44 @@ local function isTool(def)
 	return false
 end
 
--- Keep rules: an item is favorited when ANY enabled rule matches it, each
--- rule with its own minimum value (e.g. gear >= $50k OR any item >= $200k).
-local mutKind = type(Mut._kindByName) == "table" and Mut._kindByName or {}
-local function keepRulesActive()
-	return S.favGear or S.favAny or S.favTools or S.favMutOn or #(S.favItems or {}) > 0
+-- Keep rules. An item is kept (favorited) when any of these is true:
+--   gear worth at least the gear minimum (0 = price rule off)
+--   gear with ANY of the picked gear mutations
+--   a Gavel trophy (when on), optionally only with ANY picked gavel mutation
+--   a named "always keep" item
+local function isGavel(def)
+	return type(def.Name) == "string" and def.Name:find("Gavel", 1, true) ~= nil
 end
-local function matchesKeepRule(def, e, wantMut, wantItem)
-	if wantItem[def.Name] then return true end
-	local value = entryValue(e)
-	if S.favGear and isGear(def, e) and value >= S.favGearMin then return true end
-	if S.favTools and isTool(def) and value >= S.favToolsMin then return true end
-	if S.favAny and value >= S.favMin then return true end
-	if S.favMutOn and value >= S.favMutMin and type(e.Mutators) == "table" then
-		local anyMut = next(wantMut) == nil
-		for _, m in ipairs(e.Mutators) do
-			local name = type(m) == "table" and m.name
-			if name and ((anyMut and mutKind[name] ~= "flag") or wantMut[name]) then return true end
-		end
+
+local function keepSets()
+	local function set(list)
+		local s = {}
+		for _, n in ipairs(list or {}) do s[n] = true end
+		return s
+	end
+	return { item = set(S.favItems), gearMut = set(S.favGearMuts), gavelMut = set(S.favGavelMuts) }
+end
+
+local function hasAnyMutation(e, wanted)
+	if next(wanted) == nil or type(e.Mutators) ~= "table" then return false end
+	for _, m in ipairs(e.Mutators) do
+		if type(m) == "table" and wanted[m.name] then return true end
+	end
+	return false
+end
+
+local function keepRulesActive()
+	return (S.favGearMin or 0) > 0 or #(S.favGearMuts or {}) > 0 or S.favGavel or #(S.favItems or {}) > 0
+end
+
+local function matchesKeepRule(def, e, sets)
+	if sets.item[def.Name] then return true end
+	if isGear(def, e) then
+		if S.favGearMin > 0 and entryValue(e) >= S.favGearMin then return true end
+		if hasAnyMutation(e, sets.gearMut) then return true end
+	end
+	if S.favGavel and isGavel(def) then
+		if next(sets.gavelMut) == nil or hasAnyMutation(e, sets.gavelMut) then return true end
 	end
 	return false
 end
@@ -1348,47 +1573,82 @@ end
 local function keepSummary()
 	if not S.autoFav then return "Auto favorite is off" end
 	local parts = {}
-	local function at(v) return v > 0 and (" worth " .. money(v) .. "+") or "" end
-	if S.favGear then parts[#parts + 1] = "gear" .. at(S.favGearMin) end
-	if S.favAny then parts[#parts + 1] = S.favMin > 0 and ("any item worth " .. money(S.favMin) .. "+") or "EVERY item" end
-	if S.favTools then parts[#parts + 1] = "tools" .. at(S.favToolsMin) end
-	if S.favMutOn then
-		local which = #(S.favMuts or {}) > 0 and table.concat(S.favMuts, "/") or "any mutation"
-		parts[#parts + 1] = which .. at(S.favMutMin)
+	if S.favGearMin > 0 then parts[#parts + 1] = "gear worth " .. money(S.favGearMin) .. "+" end
+	if #(S.favGearMuts or {}) > 0 then parts[#parts + 1] = "gear with " .. table.concat(S.favGearMuts, " or ") end
+	if S.favGavel then
+		parts[#parts + 1] = #(S.favGavelMuts or {}) > 0 and ("gavels with " .. table.concat(S.favGavelMuts, " or ")) or "all gavels"
 	end
-	if #(S.favItems or {}) > 0 then parts[#parts + 1] = #S.favItems .. " named item(s)" end
-	return #parts > 0 and ("Keeps: " .. table.concat(parts, ", ")) or "No keep rules on"
+	if #(S.favItems or {}) > 0 then parts[#parts + 1] = #S.favItems .. " always-keep item(s)" end
+	return #parts > 0 and ("Keeps: " .. table.concat(parts, ", ")) or "No keep rules set"
 end
 
+-- True when an inventory entry should never leave: already favorited, or it
+-- matches a keep rule (even if auto favorite has not reached it yet).
+local function isKept(e)
+	if type(e) ~= "table" then return true end
+	if e.Favorited == true then return true end
+	if not (S.autoFav and keepRulesActive()) then return false end
+	local def = Items[tostring(e.ItemId)]
+	if not def then return false end
+	return matchesKeepRule(def, e, keepSets())
+end
+
+-- ToggleFavoriteItem is a toggle, so calling it on an item that is already a
+-- favorite would REMOVE the favorite. To make that impossible this pass only
+-- ever turns favorites on: it re-reads the inventory right before each call,
+-- skips anything already favorited (for stacks, if any copy is), checks the
+-- result with a fresh read, and never sends a second, corrective toggle.
+local favFailUntil = {}
 local function favoritePass()
 	if not keepRulesActive() then return end
 	local inv = invoke(Rm.GetInventory)
 	if type(inv) ~= "table" then return end
-	local wantMut, wantItem = {}, {}
-	for _, n in ipairs(S.favMuts or {}) do wantMut[n] = true end
-	for _, n in ipairs(S.favItems or {}) do wantItem[n] = true end
-	local doneKeys = {}
+	local sets = keepSets()
+	local now = os.clock()
+	local todo, seenStack = {}, {}
 	for guid, e in pairs(inv) do
-		if type(e) == "table" and e.Favorited ~= true then
-			local def = Items[tostring(e.ItemId)]
-			local hit = def and matchesKeepRule(def, e, wantMut, wantItem)
-			if hit then
-				-- stacks share one favorite flag; toggle a stack only once per pass
-				local key = (def and def.Stackable) and ("stack:" .. tostring(e.ItemId)) or guid
-				if not doneKeys[key] then
-					doneKeys[key] = true
-					local r = invoke(Rm.ToggleFavorite, guid)
-					if r == true then Auto.favorited += 1
-					elseif r == false then invoke(Rm.ToggleFavorite, guid) end -- it was already on via its stack
-					task.wait(0.15)
-				end
+		local def = type(e) == "table" and Items[tostring(e.ItemId)]
+		if def and e.Favorited ~= true and (favFailUntil[guid] or 0) < now and matchesKeepRule(def, e, sets) then
+			local stackKey = def.Stackable and tostring(e.ItemId) or nil
+			if not (stackKey and seenStack[stackKey]) then
+				if stackKey then seenStack[stackKey] = true end
+				todo[#todo + 1] = { guid = guid, stackKey = stackKey }
 			end
 		end
+	end
+	local function safeToFavorite(fresh, job)
+		local e = fresh[job.guid]
+		if type(e) ~= "table" or e.Favorited == true then return false end
+		if job.stackKey then
+			for _, other in pairs(fresh) do
+				if type(other) == "table" and tostring(other.ItemId) == job.stackKey and other.Favorited == true then return false end
+			end
+		end
+		return true
+	end
+	for _, job in ipairs(todo) do
+		if not Hub.alive then return end
+		local fresh = invoke(Rm.GetInventory)
+		if type(fresh) ~= "table" then return end
+		if safeToFavorite(fresh, job) then
+			invoke(Rm.ToggleFavorite, job.guid)
+			task.wait(0.3)
+			local after = invoke(Rm.GetInventory)
+			local e = type(after) == "table" and after[job.guid]
+			if type(e) == "table" and e.Favorited == true then
+				Auto.favorited += 1
+			else
+				-- not confirmed: leave it alone for a while rather than toggle again
+				favFailUntil[job.guid] = os.clock() + 300
+				Auto.favNote = "Could not confirm a favorite; will retry in 5 min"
+			end
+		end
+		task.wait(0.15)
 	end
 end
 
 ---------------------------------------------------------------------------
--- Plot: unload vehicle, fill shelves, price, offers
+-- Plot: unload vehicle, fill shelves
 ---------------------------------------------------------------------------
 
 local function plotData()
@@ -1456,9 +1716,12 @@ local function dumpStep(force)
 	-- First try unloading where the car is. If the server accepts that, the
 	-- car never has to drive to the plot; if not, remember and drive instead.
 	if S.unloadAnywhere and Auto.remoteUnload ~= false then
-		Rm.Unload:FireServer(guids)
-		task.wait(1.5)
-		local after = vehicleItemCount()
+		local ok, after = runItems("unload", function()
+			Rm.Unload:FireServer(guids)
+			task.wait(1.5)
+			return vehicleItemCount()
+		end)
+		if not ok or type(after) ~= "number" then after = count end
 		if after < count then
 			Auto.remoteUnload = true
 			Auto.overweightAt = 0
@@ -1493,8 +1756,10 @@ local function dumpStep(force)
 		end
 		task.wait(1.2)
 	end
-	Rm.Unload:FireServer(guids)
-	task.wait(1.5)
+	runItems("unload", function()
+		Rm.Unload:FireServer(guids)
+		task.wait(1.5)
+	end)
 	Auto.overweightAt = 0
 	Auto.lastList = 0 -- put the unloaded items on shelves soon
 	Auto.status = string.format("Unloaded %d item(s) at your plot; cargo %d%%", #guids, math.floor(cargoPct()))
@@ -1513,9 +1778,11 @@ local function listPass()
 		local list = {}
 		for guid in pairs(type(p.Fits) == "table" and p.Fits or {}) do
 			local e = inv[guid]
-			if type(e) == "table" and e.Favorited ~= true then
+			-- the server lists favorites if asked, so filter here: never list a
+			-- favorite or anything a keep rule covers (e.g. a Gavel not yet favorited)
+			if type(e) == "table" and not isKept(e) then
 				local v = entryValue(e)
-				if v >= S.listMin then list[#list + 1] = { guid = guid, v = v } end
+				if v >= S.listMin and (S.listMax <= 0 or v <= S.listMax) then list[#list + 1] = { guid = guid, v = v } end
 			end
 		end
 		table.sort(list, function(a, b) return a.v > b.v end)
@@ -1529,23 +1796,6 @@ local function listPass()
 				Auto.listed += tonumber(r.Placed) or 0
 			elseif type(r) == "table" then
 				Auto.listNote = "Shelves: " .. tostring(r.Error or "rejected")
-			end
-		end
-	end
-	-- price: a percentage of the price each item was first listed at (its value)
-	if S.listPct ~= 100 and Rm.GetMyPlacedItems and Rm.ChangeStockPrice then
-		local placed = invoke(Rm.GetMyPlacedItems)
-		for _, it in ipairs(type(placed) == "table" and placed or {}) do
-			local e = type(it) == "table" and it.Entry
-			if it.IsForSale and type(e) == "table" and it.Guid and tonumber(e.StockPrice) then
-				local base = Auto.basePrice[it.Guid] or tonumber(e.StockPrice)
-				Auto.basePrice[it.Guid] = base
-				if Auto.priced[it.Guid] ~= S.listPct then
-					local target = math.floor(base * S.listPct + 0.5) / 100
-					Rm.ChangeStockPrice:FireServer(it.Guid, target)
-					Auto.priced[it.Guid] = S.listPct
-					task.wait(0.1)
-				end
 			end
 		end
 	end
@@ -1693,20 +1943,25 @@ local auction = ui:Tab("Auction")
 auction:Section("Bidding")
 auction:Toggle({ Id = "autoBid", Text = "Auto bid", Hint = "Bids whenever you are outbid", Default = D("autoBid", false) })
 auction:Number({ Id = "maxBid", Text = "Max bid", Hint = "0 = no limit", Default = D("maxBid", 0), Min = 0, Prefix = "$" })
-auction:Number({ Id = "blueMaxBid", Text = "Max bid with a blue item", Hint = "Used when the lot has a blue item; 0 = same as max", Default = D("blueMaxBid", 0), Min = 0, Prefix = "$" })
+auction:Number({ Id = "blueMaxBid", Text = "Max bid with an outlined item", Hint = "Ignores lot value; 0 = same as max bid", Default = D("blueMaxBid", 0), Min = 0, Prefix = "$" })
 auction:Number({ Id = "keepCash", Text = "Always keep cash", Default = D("keepCash", 0), Min = 0, Prefix = "$" })
 auction:Number({ Id = "bidDelay", Text = "Bid delay", Default = D("bidDelay", 0.35), Min = 0.05, Max = 3, Suffix = "s" })
 auction:Number({ Id = "bidPctOfValue", Text = "Max bid as % of lot value", Hint = "Uses the item reveal estimate; 0 = off", Default = D("bidPctOfValue", 0), Min = 0, Max = 1000, Suffix = "%" })
 auction:Section("Lot filter")
-auction:Toggle({ Id = "lotFilter", Text = "Check lots before bidding", Hint = "Bids only on lots that pass the checks below", Default = D("lotFilter", false) })
+auction:Toggle({ Id = "lotFilter", Text = "Check lots before bidding", Hint = "Lots with an outlined item always pass", Default = D("lotFilter", false) })
 auction:Number({ Id = "minStartBid", Text = "Starting bid at least", Hint = "0 = any", Default = D("minStartBid", 0), Min = 0, Prefix = "$" })
 auction:List({ Id = "lotMuts", Text = "Lot has a mutation", Hint = "At least one item with any of these", Multi = true, Options = mutationNames, Default = D("lotMuts", {}), Empty = "Any" })
-auction:Toggle({ Id = "leaveFailed", Text = "Leave lots that fail", Hint = "Skips that garage for 5 minutes; the entry fee is not refunded", Default = D("leaveFailed", true) })
+auction:Toggle({ Id = "leaveFailed", Text = "Leave lots that fail", Hint = "Moves on at once; skips that garage 5 min (no fee refund)", Default = D("leaveFailed", true) })
 auction:Section("Item reveal")
 auction:Toggle({ Id = "esp", Text = "Item reveal ESP", Hint = "Names hidden items and X-rayed boxes", Default = D("esp", false) })
 auction:Number({ Id = "espDistance", Text = "Label distance", Default = D("espDistance", 150), Min = 50, Max = 500, Suffix = " studs" })
 auction:Number({ Id = "espMinConf", Text = "Minimum match confidence", Default = D("espMinConf", 25), Min = 0, Max = 100, Suffix = "%" })
 local lotInfo = auction:Info("Lot: -")
+auction:Section("Airdrops")
+auction:Toggle({ Id = "airdropAlerts", Text = "Airdrop alerts", Hint = "Pop-up when crates fall and land", Default = D("airdropAlerts", true) })
+auction:Toggle({ Id = "airdropMarkers", Text = "Airdrop markers", Hint = "Countdown label on each crate", Default = D("airdropMarkers", true) })
+auction:Toggle({ Id = "autoAirdrop", Text = "Auto open airdrops", Hint = "Needs " .. money(AIR_MIN_WORTH) .. " net worth; before normal auctions", Default = D("autoAirdrop", false) })
+local airInfo = auction:Info("Airdrops: none right now")
 auction:Section("Where")
 auction:List({ Id = "areas", Text = "Areas", Hint = "Where to open auctions", Multi = true, Options = areaNames, Default = D("areas", {}), Empty = "All" })
 auction:Choice({ Id = "garagePick", Text = "Garage choice", Options = { "Nearest", "Cheapest", "Priciest" }, Default = D("garagePick", "Nearest") })
@@ -1715,9 +1970,7 @@ auction:Toggle({ Id = "autoAuction", Text = "Auto open auctions", Hint = "Opens 
 auction:Toggle({ Id = "bringCar", Text = "Bring car to auctions", Hint = "Parks your car outside the garage before opening it", Default = D("bringCar", false) })
 auction:Button({ Text = "Quick open auction", Action = "Open", Callback = function()
 	if A.active then ui:SetStatus("Already in an auction", "ok"); return end
-	Auto.busy = true
-	local ok, err = pcall(joinAuction)
-	Auto.busy = false
+	local ok, err = runBody("quick open", joinAuction)
 	if not ok then Auto.status = "Open failed: " .. tostring(err) end
 end })
 auction:Button({ Text = "Leave current auction", Action = "Leave", Callback = function() invoke(Rm.LeaveAuction) end })
@@ -1727,29 +1980,35 @@ local itemsTab = ui:Tab("Items")
 itemsTab:Section("After winning")
 itemsTab:Toggle({ Id = "autoTake", Text = "Auto take items", Hint = "Adds won items to your vehicle", Default = D("autoTake", false) })
 itemsTab:Number({ Id = "minTake", Text = "Minimum value to take", Hint = "Cheaper items are left behind", Default = D("minTake", 0), Min = 0, Prefix = "$" })
-itemsTab:Toggle({ Id = "takeBlue", Text = "Always take blue items", Hint = "Ignores the minimum for outlined items", Default = D("takeBlue", true) })
+itemsTab:Toggle({ Id = "takeBlue", Text = "Always take outlined items", Hint = "Blue or white outline; ignores the minimum", Default = D("takeBlue", true) })
+itemsTab:List({ Id = "takeMuts", Text = "Always take mutations", Hint = "Ignores the minimum for these", Multi = true, Options = mutationNames, Default = D("takeMuts", {}), Empty = "None" })
+itemsTab:List({ Id = "takeNames", Text = "Always take", Hint = "These items, ignoring the minimum", Multi = true, Options = itemNames, Default = D("takeNames", {}), Empty = "None" })
 itemsTab:Toggle({ Id = "autoOpen", Text = "Auto open boxes", Default = D("autoOpen", false) })
 itemsTab:Toggle({ Id = "autoRepair", Text = "Auto repair", Hint = "Wrench on won items, plus repair shop slots", Default = D("autoRepair", false) })
 itemsTab:Section("Keep (favorite)")
 itemsTab:Toggle({ Id = "autoFav", Text = "Auto favorite", Hint = "Kept items are never listed or sold", Default = D("autoFav", false) })
 local keepInfo = itemsTab:Info("-")
-itemsTab:Rule({ Id = "favGear", ValueId = "favGearMin", Text = "Gear", Hint = "Wearables, car parts, boards", Default = D("favGear", true), Value = D("favGearMin", 0), Min = 0, Prefix = "$" })
-itemsTab:Rule({ Id = "favAny", ValueId = "favMin", Text = "Any item", Hint = "Worth at least", Default = D("favAny", (tonumber(saved.favMin) or 0) > 0), Value = D("favMin", 0), Min = 0, Prefix = "$" })
-itemsTab:Rule({ Id = "favMutOn", ValueId = "favMutMin", Text = "Mutated items", Hint = "Mutations picked below", Default = D("favMutOn", #D("favMuts", {}) > 0), Value = D("favMutMin", 0), Min = 0, Prefix = "$" })
-itemsTab:List({ Id = "favMuts", Text = "Mutations", Hint = "For the rule above", Multi = true, Options = mutationNames, Default = D("favMuts", {}), Empty = "Any mutation" })
-itemsTab:Rule({ Id = "favTools", ValueId = "favToolsMin", Text = "Tools and consumables", Hint = "Rods, pans, drinks, sprays", Default = D("favTools", false), Value = D("favToolsMin", 0), Min = 0, Prefix = "$" })
+itemsTab:Number({ Id = "favGearMin", Text = "Gear minimum price", Hint = "Keep gear worth at least this; 0 = off", Default = D("favGearMin", 0), Min = 0, Prefix = "$" })
+itemsTab:List({ Id = "favGearMuts", Text = "Gear mutations", Hint = "Keep gear with any of these, at any price", Multi = true, Options = mutationNames, Default = D("favGearMuts", {}), Empty = "None" })
+itemsTab:Toggle({ Id = "favGavel", Text = "Gavel", Hint = "Keep Gavel trophies", Default = D("favGavel", false) })
+itemsTab:List({ Id = "favGavelMuts", Text = "Gavel mutations", Hint = "Only gavels with any of these; none = all", Multi = true, Options = mutationNames, Default = D("favGavelMuts", {}), Empty = "Any" })
 itemsTab:List({ Id = "favItems", Text = "Always keep", Hint = "These items at any value", Multi = true, Options = itemNames, Default = D("favItems", {}), Empty = "None" })
-itemsTab:Button({ Text = "Favorite matching items now", Action = "Run", Callback = favoritePass })
+itemsTab:Button({ Text = "Favorite matching items now", Action = "Run", Callback = function() runItems("favorite", favoritePass) end })
 local itemsInfo = itemsTab:Info("-")
 
 local plotTab = ui:Tab("Plot")
 plotTab:Section("Shelves")
 plotTab:Toggle({ Id = "autoList", Text = "Auto list on shelves", Hint = "Fills free slots with unfavorited items", Default = D("autoList", false) })
-plotTab:Number({ Id = "listMin", Text = "Only list items worth", Hint = "At least this much", Default = D("listMin", 0), Min = 0, Prefix = "$" })
-plotTab:Number({ Id = "listPct", Text = "Asking price", Hint = "% of value (game allows 50-150)", Default = D("listPct", 100), Min = 50, Max = 150, Suffix = "%" })
-plotTab:Button({ Text = "Fill shelves now", Action = "Fill", Callback = listPass })
+plotTab:Number({ Id = "listMin", Text = "Only list items worth at least", Hint = "0 = no minimum", Default = D("listMin", 0), Min = 0, Prefix = "$" })
+plotTab:Number({ Id = "listMax", Text = "Only list items worth at most", Hint = "0 = no maximum", Default = D("listMax", 0), Min = 0, Prefix = "$" })
+plotTab:Button({ Text = "Fill shelves now", Action = "Fill", Callback = function() runItems("list", listPass) end })
 local function goToPlot()
-	if Rm.TeleportToPlot then Rm.TeleportToPlot:FireServer(); ui:SetStatus("Teleporting to your plot", "ok") end
+	if not Rm.TeleportToPlot then return end
+	runBody("plot teleport", function()
+		Rm.TeleportToPlot:FireServer()
+		task.wait(1)
+	end)
+	ui:SetStatus("Teleported to your plot", "ok")
 end
 plotTab:Button({ Text = "Go to my plot", Action = "Go", Callback = goToPlot })
 plotTab:Section("Vehicle")
@@ -1757,17 +2016,11 @@ plotTab:Toggle({ Id = "autoUnload", Text = "Auto unload at plot", Hint = "Pauses
 plotTab:Number({ Id = "dumpAt", Text = "Unload when cargo reaches", Hint = "Auctions resume 30 points below this", Default = D("dumpAt", 85), Min = 40, Max = 100, Suffix = "%" })
 plotTab:Toggle({ Id = "unloadAnywhere", Text = "Try unloading without moving", Hint = "Falls back to driving to the plot if refused", Default = D("unloadAnywhere", true) })
 local function unloadNow()
-	if Auto.busy then ui:SetStatus("Busy with another task, try again in a moment"); return end
-	Auto.busy = true
-	local ok, err = pcall(dumpStep, true)
-	Auto.busy = false
+	if Locks.body.owner then ui:SetStatus("Unload queued after " .. Locks.body.owner, "busy") end
+	local ok, err = runBody("unload", dumpStep, true)
 	if not ok then Auto.status = "Unload error: " .. tostring(err) end
 end
 plotTab:Button({ Text = "Unload vehicle now", Action = "Unload", Callback = unloadNow })
-plotTab:Section("Offers")
-plotTab:Toggle({ Id = "autoAccept", Text = "Auto accept offers", Default = D("autoAccept", false) })
-plotTab:Number({ Id = "acceptPct", Text = "Accept at least", Hint = "% of the asking price", Default = D("acceptPct", 100), Min = 1, Max = 300, Suffix = "%" })
-plotTab:Toggle({ Id = "declineLow", Text = "Decline lower offers", Hint = "Otherwise they are left for you", Default = D("declineLow", true) })
 local plotInfo = plotTab:Info("-")
 
 -- Top bar: one button per shop screen, plus your plot.
@@ -1800,7 +2053,8 @@ local placePick = moveTab:List({ Id = "tpPlace", Text = "Place", Multi = false, 
 moveTab:Button({ Text = "Go to place", Action = "Go", Callback = function()
 	local get = S.tpPlace and places[S.tpPlace]
 	if not get then ui:SetStatus("Pick a place first"); return end
-	if not tpTo(get()) then ui:SetStatus("That place is not loaded") end
+	local ok, moved = runBody("teleport", function() return tpTo(get()) end)
+	if not (ok and moved) then ui:SetStatus("That place is not loaded") end
 end })
 local function playerNames()
 	local list = {}
@@ -1812,7 +2066,7 @@ moveTab:List({ Id = "tpPlayer", Text = "Player", Multi = false, Options = player
 moveTab:Button({ Text = "Go to player", Action = "Go", Callback = function()
 	local p = S.tpPlayer and Players:FindFirstChild(S.tpPlayer)
 	local hrp = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-	if hrp then tpTo(hrp.Position + Vector3.new(3, 0, 0)) else ui:SetStatus("Player has no character") end
+	if hrp then runBody("teleport", tpTo, hrp.Position + Vector3.new(3, 0, 0)) else ui:SetStatus("Player has no character") end
 end })
 moveTab:Section("Movement")
 moveTab:Toggle({ Id = "wsOn", Text = "Walk speed", Default = D("wsOn", false) })
@@ -1833,7 +2087,12 @@ local conns = ui.conns
 local function on(signal, fn) if signal then table.insert(conns, signal:Connect(fn)) end end
 
 on(Rm.ToggleArea and Rm.ToggleArea.OnClientEvent, function(inZone, garage)
-	if inZone then A.garage = garage; scanLotForBlue(); return end
+	if inZone then
+		A.garage = garage
+		scanLotForBlue()
+		beginLotCheck(garage) -- judge the lot during the countdown
+		return
+	end
 	-- keep the character inside the zone while an auction we opened runs
 	-- (but not when we just left a lot on purpose)
 	if os.clock() - (Auto.leftAt or 0) < 15 then return end
@@ -1855,19 +2114,21 @@ on(Rm.ToggleBiddingUI and Rm.ToggleBiddingUI.OnClientEvent, function(open)
 	A.active = open and true or false
 	A.winner, A.amount, A.nextPrice, A.paused = nil, 0, nil, false
 	if open then
-		A.openedAt = os.clock()
-		A.filter = S.lotFilter and "checking" or "off"
-		A.filterWhy = nil
+		beginLotCheck(A.garage) -- no-op if the check already started in the zone
 		scanLotForBlue()
 	else
-		A.garage, A.hasBlue, A.startBid = nil, false, nil
-		Auto.lastAuctionEnd = os.clock()
+		A.garage, A.hasBlue, A.startBid, A.filterGarage, A.filter = nil, false, nil, nil, nil
+		-- after a lot we left on purpose, go straight on; otherwise wait for results
+		if os.clock() - (Auto.leftAt or 0) > 10 then Auto.lastAuctionEnd = os.clock() end
 	end
 end)
 on(Rm.UpdateWinning and Rm.UpdateWinning.OnClientEvent, function(amount, winner, _, nextPrice, garage)
 	if A.garage and garage and garage ~= A.garage then return end
 	if not amount or not winner then return end
-	if not A.garage and A.active and typeof(garage) == "Instance" then A.garage = garage end
+	if not A.garage and A.active and typeof(garage) == "Instance" then
+		A.garage = garage
+		beginLotCheck(garage)
+	end
 	if winner == "Starting" then A.startBid = tonumber(amount) end
 	A.amount, A.winner = amount, winner
 	if nextPrice then A.nextPrice = nextPrice end
@@ -1878,52 +2139,10 @@ end)
 on(Rm.SpawnResult and Rm.SpawnResult.OnClientEvent, function(ok, msg) Auto.spawnResult = { ok = ok, msg = msg } end)
 on(Rm.OfferOverweight and Rm.OfferOverweight.OnClientEvent, function() Auto.overweightAt = os.clock() end)
 
--- Offers stay open until the game hides them, so keep every open offer and
--- decide on each one, including offers that arrived before the toggle.
-local offers = {}
-on(Rm.ShowOffer and Rm.ShowOffer.OnClientEvent, function(offerId, npc, _, offer, ref)
-	offers[offerId] = { npc = npc, offer = tonumber(offer), ref = tonumber(ref), at = os.clock() }
-end)
-on(Rm.HideOffer and Rm.HideOffer.OnClientEvent, function(offerId)
-	offers[offerId] = nil
-end)
 -- a sale frees a shelf slot: fill it again soon
 on(Rm.CashEffect and Rm.CashEffect.OnClientEvent, function()
 	Auto.lastList = math.min(Auto.lastList, os.clock() - 6)
 end)
-local function answerOffer(offerId, o, accept)
-	local head = typeof(o.npc) == "Instance" and o.npc:FindFirstChild("Head")
-	local _, hrp = getChar()
-	-- the game's own card acknowledges offers it shows; do it ourselves when it can't
-	if not (head and hrp and (head.Position - hrp.Position).Magnitude <= 55) and Rm.OfferPresented then
-		pcall(Rm.OfferPresented.FireServer, Rm.OfferPresented, offerId, o.offer, o.npc)
-	end
-	pcall(Rm.RespondOffer.FireServer, Rm.RespondOffer, offerId, accept)
-end
-local function offerPass()
-	local now = os.clock()
-	for offerId, o in pairs(offers) do
-		if now - o.at > 120 then
-			offers[offerId] = nil
-		elseif S.autoAccept and not o.sent and now - o.at > 0.3 then
-			o.sent = true
-			local pct = (o.offer and o.ref and o.ref > 0) and (o.offer / o.ref * 100) or nil
-			if not pct then
-				Auto.offerNote = string.format("Offer %s has no reference price; left for you", money(o.offer))
-			elseif pct >= S.acceptPct then
-				answerOffer(offerId, o, true)
-				Auto.accepted += 1
-				Auto.offerNote = string.format("Accepted %s (%d%% of price)", money(o.offer), math.floor(pct + 0.5))
-			elseif S.declineLow then
-				answerOffer(offerId, o, false)
-				Auto.declined = (Auto.declined or 0) + 1
-				Auto.offerNote = string.format("Declined %s (%d%% of price)", money(o.offer), math.floor(pct + 0.5))
-			else
-				Auto.offerNote = string.format("Left %s for you (%d%% of price)", money(o.offer), math.floor(pct + 0.5))
-			end
-		end
-	end
-end
 
 on(game:GetService("UserInputService").JumpRequest, function()
 	if not S.infJump then return end
@@ -1947,10 +2166,85 @@ end)
 -- Loops
 ---------------------------------------------------------------------------
 
+-- Airdrop markers (countdown over each crate) and alerts.
+local markerFolder = Instance.new("Folder")
+markerFolder.Name = "SHHubAirdrops"
+markerFolder.Parent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+local markers = {}
+local AIR_COLOR = typeof(AirCfg.MarkerColor) == "Color3" and AirCfg.MarkerColor or Color3.fromRGB(150, 170, 90)
+
+local function refreshAirdrops()
+	local tagged = CollectionService:GetTagged(AIR_TAG)
+	local live = {}
+	for _, inst in ipairs(tagged) do live[inst] = true end
+	for inst, m in pairs(markers) do
+		if not live[inst] or not S.airdropMarkers then m.board:Destroy(); markers[inst] = nil end
+	end
+	if S.airdropMarkers then
+		for _, inst in ipairs(tagged) do
+			local m = markers[inst]
+			if not m then
+				local adornee = inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart", true)
+				if adornee then
+					local board = Instance.new("BillboardGui")
+					board.AlwaysOnTop = true
+					board.Size = UDim2.fromOffset(150, 42)
+					board.StudsOffset = Vector3.new(0, 7, 0)
+					board.MaxDistance = 3000
+					board.Adornee = adornee
+					local text = Instance.new("TextLabel")
+					text.Size = UDim2.fromScale(1, 1)
+					text.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+					text.BackgroundTransparency = 0.25
+					text.TextColor3 = AIR_COLOR
+					text.TextStrokeTransparency = 0.5
+					text.Font = Enum.Font.GothamBold
+					text.TextScaled = true
+					text.Parent = board
+					board.Parent = markerFolder
+					m = { board = board, label = text }
+					markers[inst] = m
+				end
+			end
+			if m then
+				local state = inst:GetAttribute(AIR_STATE)
+				local left = airdropTimeLeft(inst)
+				local line
+				if state == "falling" then line = "falling"
+				elseif inst:GetAttribute("InAuction") then line = "in auction"
+				elseif left then line = string.format("%d:%02d left", math.max(0, left) // 60, math.max(0, math.floor(left)) % 60)
+				else line = tostring(state or "") end
+				m.label.Text = "AIRDROP\n" .. line
+			end
+		end
+	end
+	-- alerts: a new wave starting to fall, and crates landing
+	local falling, landed, nearest = airdropSummary()
+	if S.airdropAlerts then
+		if falling > 0 and (Auto.airFalling or 0) == 0 then
+			ui:Toast(string.format("Airdrop incoming: %d crate%s falling", falling, falling == 1 and "" or "s"), 8)
+		elseif landed > (Auto.airLanded or 0) then
+			local ok, why = airdropEligible()
+			ui:Toast(string.format("Airdrop landed: %d crate%s, 10 min to open%s", landed, landed == 1 and "" or "s",
+				ok and "" or (" - opening " .. why)), 8)
+		end
+	end
+	Auto.airFalling, Auto.airLanded = falling, landed
+	-- summary line
+	if falling + landed == 0 then
+		airInfo("Airdrops: none right now")
+	else
+		local ok, why = airdropEligible()
+		airInfo(string.format("Airdrops: %d falling, %d landed%s%s", falling, landed,
+			nearest and string.format(" (nearest %d:%02d left)", math.max(0, nearest) // 60, math.max(0, math.floor(nearest)) % 60) or "",
+			ok and "" or ("; " .. why)))
+	end
+end
+
 local function autoStep()
 	local now = os.clock()
 	if A.active then
-		Auto.status = "In auction" .. (A.hasBlue and " (blue item in lot)" or "")
+		Auto.status = "In auction" .. (A.hasBlue and " (outlined item in lot)" or "")
 		if now - (Auto.lastScan or 0) > 1 then Auto.lastScan = now; scanLotForBlue() end
 		return
 	end
@@ -1968,6 +2262,11 @@ local function autoStep()
 		Auto.dumping = false
 		high = vehicleFull({}) or cargoPct() >= S.dumpAt
 	end
+	-- airdrop crates vanish after 10 minutes, so they go before normal auctions
+	if S.autoAirdrop and not high and airdropEligible() and nextAirdrop() then
+		openAirdrop()
+		return
+	end
 	if S.autoAuction then
 		if high then Auto.status = string.format("Auctions paused: cargo %d%% (turn on Auto unload)", math.floor(cargoPct())); return end
 		if now - Auto.lastJoin >= 3 then joinAuction() end
@@ -1979,6 +2278,8 @@ end
 -- bidding: light and frequent
 task.spawn(function()
 	while Hub.alive do
+		-- the lot check runs whether or not auto bid is on, so rejects leave fast
+		if A.filter == "checking" and A.garage then pcall(checkLot) end
 		local ok, err = pcall(bidTick, os.clock())
 		if not ok then A.status = "Bid error: " .. tostring(err) end
 		task.wait(0.05)
@@ -1991,9 +2292,14 @@ task.spawn(function()
 	while Hub.alive do
 		local now = os.clock()
 		local ok, err = pcall(function()
-			if S.autoList and now - Auto.lastList >= 8 then Auto.lastList = now; listPass() end
-			if S.autoFav and now - Auto.lastFav >= 20 then Auto.lastFav = now; favoritePass() end
-			if S.autoRepair and now - Auto.lastRepair >= 15 then Auto.lastRepair = now; repairShopPass() end
+			-- favorite first, so new keepers are protected before shelves are filled
+			local function chore(name, fn)
+				local done, why = runItems(name, fn)
+				if not done then Auto.listNote = name .. ": " .. tostring(why) end
+			end
+			if S.autoFav and now - Auto.lastFav >= 20 then Auto.lastFav = now; chore("auto favorite", favoritePass) end
+			if S.autoList and now - Auto.lastList >= 8 then Auto.lastList = now; chore("auto list", listPass) end
+			if S.autoRepair and now - Auto.lastRepair >= 15 then Auto.lastRepair = now; chore("repair shop", repairShopPass) end
 		end)
 		if not ok then Auto.listNote = "Chores error: " .. tostring(err) end
 		task.wait(1)
@@ -2003,14 +2309,13 @@ end)
 -- automation: one movement step at a time, never overlapping
 task.spawn(function()
 	while Hub.alive do
-		local anyAuto = S.autoTake or S.autoOpen or S.autoRepair or S.autoUnload or S.autoAuction
-		if anyAuto and not Auto.busy then
-			Auto.busy = true
-			local ok, err = pcall(autoStep)
+		local anyAuto = S.autoTake or S.autoOpen or S.autoRepair or S.autoUnload or S.autoAuction or S.autoAirdrop
+		if anyAuto then
+			-- waits its turn if a button (quick open, teleport, unload) is moving you
+			local ok, err = runBody("automation", autoStep)
 			if not ok then Auto.status = "Error: " .. tostring(err) end
-			Auto.busy = false
-		elseif not anyAuto and not Auto.busy then
-			Auto.status = A.active and ("In auction" .. (A.hasBlue and " (blue item in lot)" or "")) or "Idle"
+		elseif not Locks.body.owner then
+			Auto.status = A.active and ("In auction" .. (A.hasBlue and " (outlined item in lot)" or "")) or "Idle"
 			if A.active and os.clock() - (Auto.lastScan or 0) > 1 then Auto.lastScan = os.clock(); scanLotForBlue() end
 		end
 		task.wait(0.5)
@@ -2032,7 +2337,7 @@ task.spawn(function()
 				end
 			end
 		end
-		offerPass()
+		pcall(refreshAirdrops)
 		local R = revealApi()
 		if R and A.garage then
 			local t = R.garageSummary(A.garage)
@@ -2049,9 +2354,9 @@ task.spawn(function()
 		keepInfo(keepSummary())
 		itemsInfo(string.format("Taken %d, opened %d, repaired %d, favorited %d  |  cargo %.1f/%s",
 			Auto.picked, Auto.opened, Auto.repaired, Auto.favorited, w, lim and tostring(lim) or "-"))
-		plotInfo(string.format("%s  |  listed %d, offers %d accepted, %d declined%s", Auto.listNote or "Shelves: -", Auto.listed,
-			Auto.accepted, Auto.declined or 0, Auto.offerNote and ("\nLast offer: " .. Auto.offerNote) or ""))
-		ui:SetStatus(Auto.status, Auto.busy and "busy" or (Auto.status == "Idle" and "idle" or "ok"))
+		plotInfo(string.format("%s  |  listed %d", Auto.listNote or "Shelves: -", Auto.listed))
+		local working = Locks.body.owner or Locks.items.owner
+		ui:SetStatus(Auto.status, working and "busy" or (Auto.status == "Idle" and "idle" or "ok"))
 		task.wait(0.3)
 	end
 end)
@@ -2067,12 +2372,12 @@ function Hub.stop()
 	pcall(function() writefile(SETTINGS_PATH, HttpService:JSONEncode(S)) end)
 	local R = env.UAIAuctionReveal
 	if R and R.headless and R.stop then pcall(R.stop) end
+	pcall(function() markerFolder:Destroy() end)
 	ui:Destroy()
 	if env.SHHub == Hub then env.SHHub = nil end
 end
 
 Hub.S, Hub.A, Hub.Auto, Hub.ui = S, A, Auto, ui
-Hub.offers = offers
 Hub.quickBar = quickBar
 if S.esp then setEsp(true) end
 ui:SetStatus("Loaded", "ok")
