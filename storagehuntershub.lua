@@ -1,13 +1,14 @@
--- Storage Hunters Hub 3.6 (Storage Hunters: Open World)
+-- Storage Hunters Hub 4.3.1 (Storage Hunters: Open World)
 -- Made by conradium, commissioned by rsl.
 -- Auto bid, auto open auctions and airdrops, take/open/repair won items, favorites,
 -- shelf listing, teleports and movement. Settings are saved.
--- Toggle the window with Right Ctrl. Stop: getgenv().SHHub.stop()
+-- Show or hide the window with Insert. Stop: getgenv().SHHub.stop()
 
 local env = getgenv()
 if env.SHHub and type(env.SHHub.stop) == "function" then pcall(env.SHHub.stop) end
-local Hub = { alive = true, version = "3.6.0" }
+local Hub = { alive = true, version = "4.3.1" }
 env.SHHub = Hub
+local Kit = (function()
 ---------------------------------------------------------------------------
 -- Compact UI kit (custom, requested for this hub)
 ---------------------------------------------------------------------------
@@ -31,6 +32,66 @@ local C = {
 	good = Color3.fromRGB(96, 214, 140),
 	off = Color3.fromRGB(58, 58, 70),
 }
+-- Themes. Every colour in the kit comes from one of these roles; switching
+-- theme repaints existing elements by swapping each role's old colour for the new.
+local ROLES = { "bg", "panel", "row", "rowHover", "line", "text", "sub", "faint", "accent", "good", "off" }
+local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
+Kit.Themes = {
+	Original = {
+		bg = rgb(16, 16, 20), panel = rgb(24, 24, 30), row = rgb(30, 30, 37), rowHover = rgb(36, 36, 44),
+		line = rgb(44, 44, 54), text = rgb(236, 236, 240), sub = rgb(150, 150, 162), faint = rgb(96, 96, 108),
+		accent = rgb(255, 122, 92), good = rgb(96, 214, 140), off = rgb(58, 58, 70),
+	},
+	["Black Teal"] = { -- near-black base, cool greys, teal accent
+		bg = rgb(13, 15, 17), panel = rgb(20, 23, 26), row = rgb(27, 31, 35), rowHover = rgb(34, 39, 44),
+		line = rgb(43, 49, 55), text = rgb(229, 236, 239), sub = rgb(145, 158, 165), faint = rgb(92, 104, 111),
+		accent = rgb(32, 196, 180), good = rgb(110, 214, 160), off = rgb(55, 62, 69),
+	},
+	Noir = { -- pure black and white, no hue at all
+		bg = rgb(4, 4, 4), panel = rgb(11, 11, 11), row = rgb(18, 18, 18), rowHover = rgb(27, 27, 27),
+		line = rgb(38, 38, 38), text = rgb(244, 244, 244), sub = rgb(158, 158, 158), faint = rgb(96, 96, 96),
+		accent = rgb(255, 255, 255), good = rgb(196, 196, 196), off = rgb(52, 52, 52),
+	},
+}
+
+local function colorKey(c)
+	return string.format("%d,%d,%d", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- Roles must all differ so a later theme switch can tell them apart.
+local function distinct(theme)
+	local seen = {}
+	for _, role in ipairs(ROLES) do
+		local c = theme[role]
+		while seen[colorKey(c)] do
+			c = Color3.new(math.clamp(c.R + 1 / 255, 0, 1), math.clamp(c.G + 1 / 255, 0, 1), math.clamp(c.B + 2 / 255, 0, 1))
+		end
+		theme[role] = c
+		seen[colorKey(c)] = true
+	end
+	return theme
+end
+
+-- A full theme from three colours: background, accent and text.
+function Kit.CustomTheme(bg, accent, text)
+	local function mix(t) return bg:Lerp(text, t) end
+	return distinct({
+		bg = bg, panel = mix(0.035), row = mix(0.065), rowHover = mix(0.1), line = mix(0.14),
+		text = text, sub = text:Lerp(bg, 0.38), faint = text:Lerp(bg, 0.6),
+		accent = accent, good = accent:Lerp(rgb(96, 214, 140), 0.6), off = mix(0.2),
+	})
+end
+
+function Kit.HexToColor(hex)
+	local r, g, b = tostring(hex or ""):match("^#?(%x%x)(%x%x)(%x%x)$")
+	if not r then return nil end
+	return Color3.fromRGB(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16))
+end
+
+function Kit.ColorToHex(c)
+	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
 local FONT = Enum.Font.Gotham
 local FONT_BOLD = Enum.Font.GothamBold
 local FONT_MED = Enum.Font.GothamMedium
@@ -60,7 +121,7 @@ end
 
 -- opts: Title, Width, Height, ToggleKey, OnClose
 function Kit.Window(opts)
-	local self = setmetatable({ tabs = {}, conns = {}, alive = true, values = {}, onChange = nil }, Kit)
+	local self = setmetatable({ tabs = {}, conns = {}, alive = true, values = {}, onChange = nil, setters = {}, title = opts.Title }, Kit)
 	local gui = new("ScreenGui", {
 		Name = "SHHub", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 60,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -131,22 +192,52 @@ function Kit.Window(opts)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
 	end))
 
-	local collapsed = false
-	local function setCollapsed(on)
-		collapsed = on
-		tween(main, { Size = UDim2.fromOffset(width, on and 44 or height) }, 0.2)
-		minimize.Text = on and "+" or "-"
-	end
-	minimize.MouseButton1Click:Connect(function() setCollapsed(not collapsed) end)
-	close.MouseButton1Click:Connect(function() self:Destroy() end)
-	local key = opts.ToggleKey or Enum.KeyCode.RightControl
+	-- Minimized: a small draggable pill with the live status; click to restore.
+	local pill = new("TextButton", {
+		Name = "Pill", Text = "", AutoButtonColor = false, Visible = false,
+		BackgroundColor3 = C.bg, BackgroundTransparency = 0.04, Size = UDim2.fromOffset(250, 40),
+		Position = main.Position, BorderSizePixel = 0,
+	}, gui)
+	corner(pill, 20)
+	stroke(pill, C.line)
+	self.pillDot = new("Frame", { BackgroundColor3 = C.faint, Size = UDim2.fromOffset(8, 8), Position = UDim2.new(0, 16, 0.5, -4) }, pill)
+	corner(self.pillDot, 4)
+	label(pill, opts.Title or "Hub", 13, C.text, FONT_BOLD, { Position = UDim2.fromOffset(32, 4), Size = UDim2.new(1, -44, 0, 17) })
+	self.pillText = label(pill, "Ready", 11, C.sub, FONT, { Position = UDim2.fromOffset(32, 20), Size = UDim2.new(1, -44, 0, 15) })
+	self.pill = pill
+	local pillDrag, pillStart, pillPos, pillMoved
+	pill.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			pillDrag, pillStart, pillPos, pillMoved = true, input.Position, pill.Position, false
+		end
+	end)
+	table.insert(self.conns, UserInputService.InputChanged:Connect(function(input)
+		if pillDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - pillStart
+			if d.Magnitude > 4 then pillMoved = true end
+			pill.Position = UDim2.new(pillPos.X.Scale, pillPos.X.Offset + d.X, pillPos.Y.Scale, pillPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(self.conns, UserInputService.InputEnded:Connect(function(input)
+		if pillDrag and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			pillDrag = false
+			if not pillMoved then self:Restore() end -- a click, not a drag
+		end
+	end))
+	minimize.MouseButton1Click:Connect(function() self:Minimize() end)
+	close.MouseButton1Click:Connect(function() self:Hide(true) end)
+	local key = opts.ToggleKey or Enum.KeyCode.Insert
 	self.toggleKey = key
+	self.toggleKeyName = key.Name
 	self.switches, self.chips = {}, {}
 	table.insert(self.conns, UserInputService.InputBegan:Connect(function(input, processed)
 		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
 		if self.capturing then self:_capture(input.KeyCode); return end
 		if processed or UserInputService:GetFocusedTextBox() then return end
-		if input.KeyCode == key then main.Visible = not main.Visible; return end
+		if input.KeyCode == key then
+			if main.Visible then self:Hide(false) else self:Restore() end
+			return
+		end
 		local binds = self.values.keybinds
 		local id = type(binds) == "table" and binds[input.KeyCode.Name]
 		local sw = id and self.switches[id]
@@ -159,32 +250,30 @@ function Kit.Window(opts)
 	return self
 end
 
--- Quick bar at the top centre of the screen.
--- items: { { Icon = "emoji", Label = "text", Callback = fn }, ... }
+-- A slim text-only bar at the top centre of the screen.
+-- items: { { Label = "text", Callback = fn }, ... }; the first ones are
+-- shown in the accent colour when Accent = true.
 function Kit:Bar(items)
 	local bar = new("Frame", {
 		Name = "QuickBar", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 62),
-		Size = UDim2.fromOffset(0, 60), AutomaticSize = Enum.AutomaticSize.X,
-		BackgroundColor3 = C.bg, BackgroundTransparency = 0.08, BorderSizePixel = 0,
+		Size = UDim2.fromOffset(0, 36), AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = C.bg, BackgroundTransparency = 0.1, BorderSizePixel = 0,
 	}, self.gui)
-	corner(bar, 12)
+	corner(bar, 18)
 	stroke(bar, C.line)
-	new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, bar)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, bar)
 	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 2), VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder }, bar)
 	for i, item in ipairs(items) do
 		local b = new("TextButton", {
-			Text = "", AutoButtonColor = false, BackgroundColor3 = C.row, BackgroundTransparency = 1,
-			Size = UDim2.fromOffset(66, 48), LayoutOrder = i,
+			Text = item.Label or "", AutoButtonColor = false, BackgroundColor3 = C.row, BackgroundTransparency = 1,
+			Size = UDim2.fromOffset(0, 26), AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = i,
+			Font = FONT_MED, TextSize = 12, TextColor3 = item.Accent and C.accent or C.sub,
 		}, bar)
-		corner(b, 8)
-		label(b, item.Icon or "", 20, C.text, FONT, {
-			Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 2), TextXAlignment = Enum.TextXAlignment.Center,
-		})
-		local caption = label(b, item.Label or "", 11, C.sub, FONT_MED, {
-			Size = UDim2.new(1, -4, 0, 16), Position = UDim2.fromOffset(2, 28), TextXAlignment = Enum.TextXAlignment.Center,
-		})
-		b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0 }); tween(caption, { TextColor3 = C.text }) end)
-		b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1 }); tween(caption, { TextColor3 = C.sub }) end)
+		corner(b, 13)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 11), PaddingRight = UDim.new(0, 11) }, b)
+		local rest = b.TextColor3
+		b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0, TextColor3 = C.text }) end)
+		b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1, TextColor3 = rest }) end)
 		b.MouseButton1Click:Connect(function()
 			task.spawn(function()
 				local ok, err = pcall(item.Callback)
@@ -193,6 +282,136 @@ function Kit:Bar(items)
 		end)
 	end
 	return bar
+end
+
+-- Repaints everything already on screen, then makes the new colours current.
+function Kit:SetTheme(theme)
+	local map = {}
+	for _, role in ipairs(ROLES) do map[colorKey(C[role])] = theme[role] end
+	local function swap(inst, prop)
+		local ok, value = pcall(function() return inst[prop] end)
+		if ok and typeof(value) == "Color3" then
+			local new = map[colorKey(value)]
+			if new then inst[prop] = new end
+		end
+	end
+	for _, d in ipairs(self.gui:GetDescendants()) do
+		if d:IsA("GuiObject") then swap(d, "BackgroundColor3") end
+		if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then swap(d, "TextColor3") end
+		if d:IsA("TextBox") then swap(d, "PlaceholderColor3") end
+		if d:IsA("UIStroke") then swap(d, "Color") end
+		if d:IsA("ScrollingFrame") then swap(d, "ScrollBarImageColor3") end
+	end
+	for _, role in ipairs(ROLES) do C[role] = theme[role] end
+end
+
+-- Window states: open, minimized (pill) or hidden (Insert brings it back).
+function Kit:Minimize()
+	self.pill.Position = self.main.Position
+	self.main.Visible = false
+	self.pill.Visible = true
+end
+
+function Kit:Restore()
+	self.pill.Visible = false
+	self.main.Visible = true
+end
+
+function Kit:Hide(notify)
+	self.main.Visible = false
+	self.pill.Visible = false
+	if notify then
+		self:Notify(self.title or "Hub", "Hidden. Press " .. self.toggleKeyName .. " to open it again.", 6)
+	end
+end
+
+-- The Roblox corner notification.
+function Kit:Notify(title, text, seconds)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", { Title = title, Text = text, Duration = seconds or 5 })
+	end)
+end
+
+-- "Are you sure?" dialog. o = { Title, Text, Confirm = "Yes", Danger = true, Callback }
+function Kit:Confirm(o)
+	if self.dialog then self.dialog:Destroy() end
+	local shade = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.45,
+		Size = UDim2.fromScale(1, 1), ZIndex = 50,
+	}, self.gui)
+	self.dialog = shade
+	local card = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(320, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.bg, ZIndex = 51,
+	}, shade)
+	corner(card, 12)
+	stroke(card, o.Danger and C.accent or C.line)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16), PaddingTop = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14) }, card)
+	new("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder }, card)
+	label(card, o.Title or "Are you sure?", 15, C.text, FONT_BOLD, { Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 1, ZIndex = 52 })
+	label(card, o.Text or "", 12, C.sub, FONT, {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+		TextTruncate = Enum.TextTruncate.None, LayoutOrder = 2, ZIndex = 52,
+	})
+	local row = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 3, ZIndex = 52 }, card)
+	local function button(text, x, primary, fn)
+		local b = new("TextButton", {
+			AutoButtonColor = false, Text = text, TextSize = 12, Font = FONT_BOLD, ZIndex = 53,
+			BackgroundColor3 = primary and C.accent or C.row, TextColor3 = primary and C.bg or C.text,
+			Size = UDim2.new(0.5, -4, 1, 0), Position = UDim2.new(x, x > 0 and 4 or 0, 0, 0),
+		}, row)
+		corner(b, 8)
+		b.MouseButton1Click:Connect(function()
+			shade:Destroy()
+			if self.dialog == shade then self.dialog = nil end
+			if fn then task.spawn(fn) end
+		end)
+	end
+	button("Cancel", 0, false, nil)
+	button(o.Confirm or "Yes", 0.5, true, o.Callback)
+end
+
+-- A card under the top bar that stays until closed.
+-- o = { Title, Text, Buttons = { { Text, Primary, Callback, Keep } } }
+-- Returns { SetText = fn, Close = fn }.
+function Kit:Alert(o)
+	if self.alert then self.alert:Destroy() end
+	local card = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 108), Size = UDim2.fromOffset(380, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.bg, BackgroundTransparency = 0.02, ZIndex = 40,
+	}, self.gui)
+	corner(card, 12)
+	stroke(card, C.accent, 1.5)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12) }, card)
+	new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, card)
+	label(card, o.Title or "", 14, C.accent, FONT_BOLD, { Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 1, ZIndex = 41 })
+	local body = label(card, o.Text or "", 12, C.text, FONT, {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+		TextTruncate = Enum.TextTruncate.None, LayoutOrder = 2, ZIndex = 41,
+	})
+	local row = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 3, ZIndex = 41 }, card)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Right }, row)
+	local api = {}
+	function api.SetText(text) if body.Parent then body.Text = text end end
+	function api.Close()
+		card:Destroy()
+		if self.alert == card then self.alert = nil end
+	end
+	for _, b in ipairs(o.Buttons or {}) do
+		local btn = new("TextButton", {
+			AutoButtonColor = false, Text = b.Text, TextSize = 12, Font = FONT_BOLD, ZIndex = 42,
+			BackgroundColor3 = b.Primary and C.accent or C.row, TextColor3 = b.Primary and C.bg or C.text,
+			Size = UDim2.fromOffset(0, 30), AutomaticSize = Enum.AutomaticSize.X,
+		}, row)
+		corner(btn, 8)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, btn)
+		btn.MouseButton1Click:Connect(function()
+			if not b.Keep then api.Close() end
+			if b.Callback then task.spawn(b.Callback) end
+		end)
+	end
+	self.alert = card
+	return api
 end
 
 -- A short notice under the top bar; a newer one replaces the older.
@@ -263,8 +482,16 @@ end
 
 function Kit:SetStatus(text, state)
 	if not self.alive then return end
+	local color = state == "busy" and C.accent or (state == "ok" and C.good or C.faint)
 	self.statusText.Text = text
-	self.statusDot.BackgroundColor3 = state == "busy" and C.accent or (state == "ok" and C.good or C.faint)
+	self.statusDot.BackgroundColor3 = color
+	if self.pillText then self.pillText.Text = text; self.pillDot.BackgroundColor3 = color end
+end
+
+-- Sets a switch by Id without counting as a user change (no save).
+function Kit:SetSwitch(id, on)
+	local set = self.setters[id]
+	if set then set(on, false) else self.values[id] = on end
 end
 
 function Kit:Destroy()
@@ -281,11 +508,11 @@ Tab.__index = Tab
 
 function Kit:Tab(name)
 	local button = new("TextButton", {
-		BackgroundColor3 = C.panel, BackgroundTransparency = 1, AutoButtonColor = false, Text = name, TextSize = 13,
+		BackgroundColor3 = C.panel, BackgroundTransparency = 1, AutoButtonColor = false, Text = name, TextSize = 12,
 		Font = FONT_MED, TextColor3 = C.sub, Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X,
 		LayoutOrder = #self.tabs + 1,
 	}, self.tabBar)
-	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, button)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, button)
 	corner(button, 6)
 	local page = new("ScrollingFrame", {
 		BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), Visible = false,
@@ -317,10 +544,19 @@ end
 
 function Tab:_next() self.order += 1; return self.order end
 
+-- Rows created after a collapsible section belong to it and fold with it.
+function Tab:_track(frame)
+	if self.group then
+		table.insert(self.group.items, frame)
+		frame.Visible = not self.group.collapsed
+	end
+	return frame
+end
+
 function Tab:_row(height)
 	local row = new("Frame", { BackgroundColor3 = C.row, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, height or 38), LayoutOrder = self:_next() }, self.page)
 	corner(row, 8)
-	return row
+	return self:_track(row)
 end
 
 function Tab:_text(row, text, hint)
@@ -334,10 +570,128 @@ function Tab:_text(row, text, hint)
 	return box
 end
 
-function Tab:Section(text)
+-- Section(text) starts a plain group. Section(text, { Collapsible = true,
+-- Collapsed = true }) makes a header you click to show/hide the rows below it.
+function Tab:Section(text, opts)
+	self.group = nil
+	if opts and opts.Collapsible then
+		local group = { items = {}, collapsed = opts.Collapsed ~= false }
+		local head = new("TextButton", {
+			BackgroundTransparency = 1, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 26),
+			LayoutOrder = self:_next(), Text = "", TextSize = 11, Font = FONT_BOLD, TextColor3 = C.sub,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, self.page)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingTop = UDim.new(0, 6) }, head)
+		local function paint() head.Text = (group.collapsed and "+  " or "-  ") .. string.upper(text) end
+		head.MouseButton1Click:Connect(function()
+			group.collapsed = not group.collapsed
+			for _, f in ipairs(group.items) do f.Visible = not group.collapsed end
+			paint()
+		end)
+		paint()
+		self.group = group
+		return head
+	end
 	local l = label(self.page, string.upper(text), 11, C.faint, FONT_BOLD, { Size = UDim2.new(1, 0, 0, 22), LayoutOrder = self:_next() })
 	new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingTop = UDim.new(0, 6) }, l)
 	return l
+end
+
+-- A step of the main loop: status dot, title, live detail line, key chip
+-- and on/off switch. api.SetDetail(text), api.SetActive(bool).
+function Tab:Step(o)
+	local row = self:_row(48)
+	local dot = new("Frame", { BackgroundColor3 = C.off, Size = UDim2.fromOffset(8, 8), Position = UDim2.new(0, 14, 0.5, -4) }, row)
+	corner(dot, 4)
+	label(row, o.Text, 14, C.text, FONT_BOLD, { Position = UDim2.fromOffset(32, 7), Size = UDim2.new(1, -140, 0, 18) })
+	local detail = label(row, "", 11, C.sub, FONT, { Position = UDim2.fromOffset(32, 26), Size = UDim2.new(1, -140, 0, 15) })
+	local track = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = C.off, Size = UDim2.fromOffset(38, 22),
+		Position = UDim2.new(1, -50, 0.5, -11),
+	}, row)
+	corner(track, 11)
+	local knob = new("Frame", { BackgroundColor3 = C.text, Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(3, 3) }, track)
+	corner(knob, 8)
+	local kit = self.kit
+	local api = { active = false }
+	local function paintDot()
+		local on = kit.values[o.Id] == true
+		dot.BackgroundColor3 = (on and api.active) and C.accent or (on and C.good or C.off)
+	end
+	function api.Set(value, fire)
+		value = value == true
+		kit:_set(o.Id, value, fire)
+		tween(track, { BackgroundColor3 = value and C.accent or C.off })
+		tween(knob, { Position = value and UDim2.fromOffset(19, 3) or UDim2.fromOffset(3, 3) })
+		paintDot()
+	end
+	function api.Get() return kit.values[o.Id] end
+	function api.SetDetail(text) if detail.Text ~= text then detail.Text = text end end
+	function api.SetActive(on) api.active = on == true; paintDot() end
+	track.MouseButton1Click:Connect(function() api.Set(not kit.values[o.Id], true) end)
+	api.Set(o.Default == true, false)
+	kit.setters[o.Id] = api.Set
+	kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end)
+	return api
+end
+
+-- A name on the left, a value on the right; returns set(valueText).
+function Tab:Stat(text)
+	local row = self:_row(32)
+	label(row, text, 12, C.sub, FONT_MED, { Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0.6, -12, 1, 0) })
+	local value = label(row, "-", 13, C.text, FONT_BOLD, {
+		Position = UDim2.new(0.6, 0, 0, 0), Size = UDim2.new(0.4, -12, 1, 0), TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	return function(v) v = tostring(v); if value.Text ~= v then value.Text = v end end
+end
+
+-- A labelled bar; returns set(fraction, valueText).
+function Tab:Meter(text)
+	local row = self:_row(34)
+	label(row, text, 12, C.sub, FONT_MED, { Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0, 64, 1, 0) })
+	local track = new("Frame", { BackgroundColor3 = C.bg, Size = UDim2.new(1, -184, 0, 8), Position = UDim2.new(0, 80, 0.5, -4) }, row)
+	corner(track, 4)
+	local fill = new("Frame", { BackgroundColor3 = C.good, Size = UDim2.fromScale(0, 1) }, track)
+	corner(fill, 4)
+	local value = label(row, "", 12, C.text, FONT_MED, {
+		Position = UDim2.new(1, -100, 0, 0), Size = UDim2.new(0, 88, 1, 0), TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	return function(frac, text)
+		frac = math.clamp(tonumber(frac) or 0, 0, 1)
+		fill.Size = UDim2.fromScale(frac, 1)
+		fill.BackgroundColor3 = frac >= 0.85 and C.accent or C.good
+		if value.Text ~= text then value.Text = text end
+	end
+end
+
+-- A row of equal buttons: { { Text = "...", Callback = fn }, ... }
+function Tab:Actions(items)
+	local row = self:_row(36)
+	row.BackgroundTransparency = 1
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, row)
+	local gap = 6 * (#items - 1) / #items
+	for i, item in ipairs(items) do
+		local b = new("TextButton", {
+			AutoButtonColor = false, Text = item.Text, TextSize = 12, Font = FONT_BOLD,
+			BackgroundColor3 = i == 1 and C.accent or C.row, TextColor3 = i == 1 and C.bg or C.text,
+			Size = UDim2.new(1 / #items, -gap, 1, 0), LayoutOrder = i,
+		}, row)
+		corner(b, 8)
+		local running = false
+		b.MouseButton1Click:Connect(function()
+			if running then return end
+			running = true
+			local original = b.Text
+			b.Text = "..."
+			task.spawn(function()
+				local ok, err = pcall(item.Callback)
+				if not ok then self.kit:SetStatus("Error: " .. tostring(err)) end
+				running = false
+				if b.Parent then b.Text = original end
+			end)
+		end)
+	end
+	return row
 end
 
 -- Toggle({ Id, Text, Hint, Default })
@@ -363,6 +717,7 @@ function Tab:Toggle(o)
 	function api.Get() return kit.values[o.Id] end
 	track.MouseButton1Click:Connect(function() api.Set(not kit.values[o.Id], true) end)
 	api.Set(o.Default == true, false)
+	kit.setters[o.Id] = api.Set
 	if o.Bind ~= false then kit:_bindChip(row, -92, o.Id, o.Text, function() api.Set(not kit.values[o.Id], true) end) end
 	return api
 end
@@ -453,7 +808,35 @@ function Tab:Rule(o)
 	end)
 	api.SetValue(o.Value or 0, false)
 	api.SetOn(o.Default == true, false)
+	kit.setters[o.Id] = api.SetOn
 	kit:_bindChip(row, -198, o.Id, o.Text, function() api.SetOn(not kit.values[o.Id], true) end)
+	return api
+end
+
+-- ColorInput({ Id, Text, Hint, Default = "#RRGGBB" }): a hex field with a swatch.
+function Tab:ColorInput(o)
+	local row = self:_row(o.Hint and 44 or 38)
+	local text = self:_text(row, o.Text, o.Hint)
+	text.Size = UDim2.new(1, -150, 1, 0)
+	local swatch = new("Frame", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -136, 0.5, -11), BackgroundColor3 = C.accent }, row)
+	corner(swatch, 6)
+	stroke(swatch, C.line)
+	local box = numberBox(row, -106)
+	box.TextXAlignment = Enum.TextXAlignment.Center
+	local kit = self.kit
+	local api = { row = row }
+	function api.Set(value, fire)
+		local c = Kit.HexToColor(value) or Kit.HexToColor(o.Default) or Color3.new(1, 1, 1)
+		local hex = Kit.ColorToHex(c)
+		kit:_set(o.Id, hex, fire)
+		box.Text = hex
+		swatch.BackgroundColor3 = c
+	end
+	function api.Get() return kit.values[o.Id] end
+	box.FocusLost:Connect(function()
+		if Kit.HexToColor(box.Text) then api.Set(box.Text, true) else box.Text = kit.values[o.Id] end
+	end)
+	api.Set(o.Default, false)
 	return api
 end
 
@@ -492,6 +875,7 @@ function Tab:List(o)
 	local kit = self.kit
 	local wrap = new("Frame", { BackgroundColor3 = C.row, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 38), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self:_next() }, self.page)
 	corner(wrap, 8)
+	self:_track(wrap)
 	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, wrap)
 	local head = new("TextButton", { BackgroundTransparency = 1, Text = "", Size = UDim2.new(1, 0, 0, o.Hint and 44 or 38), LayoutOrder = 1 }, wrap)
 	self:_text(head, o.Text, o.Hint)
@@ -625,6 +1009,9 @@ function Tab:Info(text)
 	return function(t) if l.Parent then l.Text = t end end
 end
 
+return Kit
+end)()
+
 ---------------------------------------------------------------------------
 -- Game access
 ---------------------------------------------------------------------------
@@ -672,6 +1059,17 @@ local Rm = {
 	GetVehicleItems = remote("Vehicles", "GetVehicleItems"),
 	Unload = remote("Vehicles", "TransferVehicleItemsToInventory"),
 	OfferOverweight = remote("UI", "OfferOverweightAdd"),
+	PickSession = remote("Locksmith", "StartPicklockSession"),
+	PickInventorySafe = remote("Locksmith", "PicklockInventorySafe"),
+	PickFailure = remote("Locksmith", "RegisterInventoryPicklockFailure"),
+	LocksmithSlots = remote("Locksmith", "GetSlotState"),
+	LocksmithStart = remote("Locksmith", "StartLocksmith"),
+	LocksmithOpen = remote("Locksmith", "OpenSafe"),
+	LocksmithClaim = remote("Locksmith", "ClaimItem"),
+	LockpickState = remote("LockpickShop", "GetState"),
+	PickupStart = remote("Auction", "AuctionPickupStart"),
+	PickupItem = remote("Auction", "AuctionPickupItem"),
+	FeePaid = remote("Auction", "AuctionFeePaid"),
 }
 
 local function invoke(rf, ...)
@@ -771,6 +1169,12 @@ local Auto = { status = "Idle", busy = false, lastStep = 0, lastAuctionEnd = 0, 
 	picked = 0, opened = 0, repaired = 0, favorited = 0, listed = 0, accepted = 0, joined = 0 }
 local spotted = setmetatable({}, { __mode = "k" })
 
+-- Session numbers for the Stats tab (since the hub started).
+local Stats = {
+	startedAt = os.clock(), startNetWorth = nil, won = 0, bidsPaid = 0, entryFees = 0, lootValue = 0,
+	mutated = 0, safes = 0, shelfSales = 0, salesCount = 0,
+}
+
 -- Two locks keep features from racing each other:
 --   body  - anything that moves your character or car (auctions, pickup,
 --           boxes, unload trips, teleports)
@@ -798,6 +1202,13 @@ local function guarded(lock, who, fn, ...)
 end
 local function runBody(who, fn, ...) return guarded(Locks.body, who, fn, ...) end
 local function runItems(who, fn, ...) return guarded(Locks.items, who, fn, ...) end
+
+-- Admin safety: while an admin is in the server (and you have not chosen to
+-- override), features are switched off and running work stops at its next step.
+local Safety = { staff = {}, paused = false, override = false, snapshot = nil }
+local function halted()
+	return not Hub.alive or Safety.paused
+end
 
 -- "Blue" items: the game outlines them for everyone (event bonus) or for
 -- you (your bonus item, e.g. a trophy with an aura).
@@ -1205,8 +1616,10 @@ local function openGarage(g, key, label)
 		local veh = vehicleNear(part.Position, part.Position + away * 14)
 		if not veh then Auto.status = "Could not bring your car; opening anyway" end
 	end
+	if halted() then return false end
 	placeNear(part.Position, 2.5)
 	task.wait(0.4)
+	if halted() then return false end
 	firePrompt(prompt)
 	local t0 = os.clock()
 	while os.clock() - t0 < 10 do
@@ -1343,6 +1756,7 @@ end
 local function openBoxes()
 	local any = false
 	for _, m in ipairs(myWonModels()) do
+		if halted() then break end
 		local prompt = m:FindFirstChild("OpenBoxPrompt", true)
 		local part = prompt and prompt.Enabled and promptPart(prompt)
 		if part then
@@ -1441,7 +1855,7 @@ local function takeItems(items)
 		if not veh then Auto.status = "Vehicle unavailable" .. (err and (": " .. tostring(err)) or ""); return end
 	end
 	for i, it in ipairs(items) do
-		if not Hub.alive then return end
+		if halted() then return end
 		if it.prompt.Parent and it.prompt.Enabled then
 			local w, lim = cargoOf(veh)
 			if not (lim and lim > 0 and w + it.weight > lim + 1e-3) then
@@ -1460,6 +1874,11 @@ local function takeItems(items)
 					Auto.pickFail[it.prompt] = f
 				else
 					Auto.picked += 1
+					-- count real mutations (not condition flags like Dirty)
+					local kinds = type(Mut._kindByName) == "table" and Mut._kindByName or {}
+					for _, mu in ipairs(it.entry.Mutators or {}) do
+						if type(mu) == "table" and mu.name and kinds[mu.name] ~= "flag" then Stats.mutated += 1; break end
+					end
 				end
 				if os.clock() - Auto.overweightAt < 3 then Auto.status = "Vehicle is full"; break end
 			end
@@ -1570,8 +1989,7 @@ local function matchesKeepRule(def, e, sets)
 	return false
 end
 
-local function keepSummary()
-	if not S.autoFav then return "Auto favorite is off" end
+local function keepRulesText()
 	local parts = {}
 	if S.favGearMin > 0 then parts[#parts + 1] = "gear worth " .. money(S.favGearMin) .. "+" end
 	if #(S.favGearMuts or {}) > 0 then parts[#parts + 1] = "gear with " .. table.concat(S.favGearMuts, " or ") end
@@ -1579,15 +1997,24 @@ local function keepSummary()
 		parts[#parts + 1] = #(S.favGavelMuts or {}) > 0 and ("gavels with " .. table.concat(S.favGavelMuts, " or ")) or "all gavels"
 	end
 	if #(S.favItems or {}) > 0 then parts[#parts + 1] = #S.favItems .. " always-keep item(s)" end
-	return #parts > 0 and ("Keeps: " .. table.concat(parts, ", ")) or "No keep rules set"
+	return #parts > 0 and table.concat(parts, ", ") or "No keep rules set"
+end
+
+local function keepSummary()
+	if not S.autoFav then return "Auto favorite is off (rules still block selling)" end
+	return "Keeps: " .. keepRulesText()
 end
 
 -- True when an inventory entry should never leave: already favorited, or it
--- matches a keep rule (even if auto favorite has not reached it yet).
+-- matches a keep rule. Keep rules protect from listing even when auto
+-- favorite is off or has not reached the item yet.
 local function isKept(e)
 	if type(e) ~= "table" then return true end
 	if e.Favorited == true then return true end
-	if not (S.autoFav and keepRulesActive()) then return false end
+	-- safes wait for "Open safes" instead of going on a shelf
+	local d = Items[tostring(e.ItemId)]
+	if S.autoSafe and d and d.SafeId then return true end
+	if not keepRulesActive() then return false end
 	local def = Items[tostring(e.ItemId)]
 	if not def then return false end
 	return matchesKeepRule(def, e, keepSets())
@@ -1627,7 +2054,7 @@ local function favoritePass()
 		return true
 	end
 	for _, job in ipairs(todo) do
-		if not Hub.alive then return end
+		if halted() then return end
 		local fresh = invoke(Rm.GetInventory)
 		if type(fresh) ~= "table" then return end
 		if safeToFavorite(fresh, job) then
@@ -1644,6 +2071,123 @@ local function favoritePass()
 			end
 		end
 		task.wait(0.15)
+	end
+end
+
+---------------------------------------------------------------------------
+-- Safes and vaults
+---------------------------------------------------------------------------
+-- Lockpick (fast): StartPicklockSession("Inventory", guid) -> sessionId; the
+-- skill check (3 pin hits) only runs on your screen; the hub waits as long as
+-- a real attempt takes, then PicklockInventorySafe(guid, sessionId).
+-- Locksmith (no minigame, timed): for safes your pick tier cannot open.
+local Safe = { note = nil, failUntil = {} }
+do
+	local okP, Picklock = pcall(require, Modules:FindFirstChild("Picklock"))
+	local okS, SafeDefs = pcall(require, Modules:FindFirstChild("Safes"))
+	Safe.Picklock = okP and Picklock or nil
+	Safe.Defs = okS and type(SafeDefs) == "table" and SafeDefs or {}
+end
+
+-- The pick you have equipped (from the Lockpick shop), or nil.
+function Safe.tool()
+	local st = invoke(Rm.LockpickState)
+	return type(st) == "table" and st.equipped or nil
+end
+
+function Safe.canPick(toolId, safeDef)
+	if not (toolId and Safe.Picklock and safeDef) then return false end
+	local ok, can = pcall(Safe.Picklock.CanOpenSafeTier, toolId, tonumber(safeDef.MinPickTier) or 0)
+	return ok and can == true
+end
+
+-- Collects finished Locksmith slots and returns the free slot numbers.
+function Safe.locksmithSlots()
+	local st = invoke(Rm.LocksmithSlots)
+	if type(st) ~= "table" then return {} end
+	local used, free = {}, {}
+	local now = workspace:GetServerTimeNow()
+	for k, s in pairs(type(st.slots) == "table" and st.slots or {}) do
+		local i = tonumber(k)
+		if i and type(s) == "table" and s.ItemGUID then
+			used[i] = true
+			if now >= (tonumber(s.StartTime) or 0) + (tonumber(s.Duration) or 0) then
+				local opened = invoke(Rm.LocksmithOpen, i)
+				if type(opened) == "table" and opened.success then
+					local claimed = invoke(Rm.LocksmithClaim, i)
+					if type(claimed) == "table" and claimed.success ~= false then
+						used[i] = nil
+						Stats.safes += 1
+					end
+				end
+			end
+		end
+	end
+	for i = 1, tonumber(st.unlockedCount) or 1 do if not used[i] then free[#free + 1] = i end end
+	return free
+end
+
+function Safe.pass()
+	if halted() then return end
+	local inv = invoke(Rm.GetInventory)
+	if type(inv) ~= "table" then return end
+	local todo = {}
+	for guid, e in pairs(inv) do
+		local def = type(e) == "table" and Items[tostring(e.ItemId)]
+		if def and def.SafeId and e.Favorited ~= true and (Safe.failUntil[guid] or 0) < os.clock() then
+			todo[#todo + 1] = { guid = guid, name = def.Name, safe = Safe.Defs[def.SafeId] or Safe.Defs[tonumber(def.SafeId)] }
+		end
+	end
+	local free = Safe.locksmithSlots()
+	if #todo == 0 then Safe.note = "No safes waiting"; return end
+	local tool = Safe.tool()
+	-- Sends a safe to a free Locksmith slot; true if it was accepted.
+	local function toLocksmith(job, why)
+		if not S.safeLocksmith then return false end
+		if #free == 0 then
+			Safe.note = job.name .. ": " .. why .. ", waiting for a free Locksmith slot"
+			return false
+		end
+		local slot = table.remove(free, 1)
+		local r = invoke(Rm.LocksmithStart, slot, job.guid, "Inventory", nil)
+		if type(r) == "table" and r.success then
+			Safe.note = job.name .. " sent to the Locksmith (" .. why .. ")"
+			return true
+		end
+		table.insert(free, 1, slot)
+		Safe.note = "Locksmith: " .. tostring(type(r) == "table" and r.error or "refused")
+		return false
+	end
+	for _, job in ipairs(todo) do
+		if halted() then return end
+		local picked, why = false, nil
+		if Safe.canPick(tool, job.safe) then
+			Safe.note = "Picking " .. job.name
+			local session = invoke(Rm.PickSession, "Inventory", job.guid)
+			if type(session) == "table" and session.success and session.sessionId then
+				task.wait(4 + math.random() * 3) -- as long as the skill check takes a player
+				if halted() then return end
+				local result = invoke(Rm.PickInventorySafe, job.guid, session.sessionId)
+				if type(result) == "table" and result.success then
+					picked = true
+					Stats.safes += 1
+					if type(result.rewardMutators) == "table" and #result.rewardMutators > 0 then Stats.mutated += 1 end
+					Safe.note = "Unlocked " .. job.name
+				else
+					why = "lockpick failed: " .. tostring(type(result) == "table" and result.error or "not opened")
+				end
+			else
+				why = "lockpick could not start: " .. tostring(type(session) == "table" and session.error or "no reply")
+			end
+			task.wait(0.5)
+		else
+			why = "lockpick tier too low"
+		end
+		-- whatever the lockpick could not do goes to the Locksmith
+		if not picked and not toLocksmith(job, why) then
+			Safe.failUntil[job.guid] = os.clock() + 120
+			if not S.safeLocksmith then Safe.note = job.name .. ": " .. why end
+		end
 	end
 end
 
@@ -1696,6 +2240,7 @@ end
 -- Unloading moves items into the inventory, so it is limited by free slots;
 -- shelf sales free more slots over time. force = unload now, ignoring cargo levels.
 local function dumpStep(force)
+	if halted() then return "done" end
 	local veh = myVehicle()
 	if not veh then Auto.status = "Unload: no vehicle spawned"; return "done" end
 	local count, items = vehicleItemCount()
@@ -1725,7 +2270,7 @@ local function dumpStep(force)
 		if after < count then
 			Auto.remoteUnload = true
 			Auto.overweightAt = 0
-			Auto.lastList = 0
+			Auto.lastFav, Auto.lastList = 0, 0 -- favorite the new items right away, then list
 			Auto.status = string.format("Unloaded %d item(s) without moving; cargo %d%%", count - after, math.floor(cargoPct()))
 			return "wait"
 		end
@@ -1761,13 +2306,13 @@ local function dumpStep(force)
 		task.wait(1.5)
 	end)
 	Auto.overweightAt = 0
-	Auto.lastList = 0 -- put the unloaded items on shelves soon
+	Auto.lastFav, Auto.lastList = 0, 0 -- favorite the new items right away, then list
 	Auto.status = string.format("Unloaded %d item(s) at your plot; cargo %d%%", #guids, math.floor(cargoPct()))
 	return "wait"
 end
 
 local function listPass()
-	if not Rm.ShelfAutoStock then return end
+	if not Rm.ShelfAutoStock or halted() then return end
 	local p = invoke(Rm.ShelfAutoStock, "preview")
 	if type(p) ~= "table" then return end
 	if not p.Ok then Auto.listNote = "Shelves: " .. tostring(p.Error or "unavailable"); return end
@@ -1929,79 +2474,20 @@ local function setEsp(on)
 	end)
 end
 
-local ui = Kit.Window({ Title = "Storage Hunters", Credit = "by conradium · commissioned by rsl", OnClose = function() Hub.stop() end })
+local ui = Kit.Window({ Title = "Storage Hunters", Credit = "by conradium · commissioned by rsl", Width = 390, Height = 600, OnClose = function() Hub.stop() end })
 ui.values = S
 S.keybinds = type(saved.keybinds) == "table" and saved.keybinds or {}
 ui.onChange = function(id, value)
 	queueSave()
 	if id == "shopBar" then if Hub.quickBar then Hub.quickBar.Visible = value end
+	elseif id == "adminGuard" or id == "adminExtra" then if Hub.checkStaff then task.spawn(Hub.checkStaff) end
+	elseif id == "theme" or id == "customBg" or id == "customAccent" or id == "customText" then
+		if Hub.applyTheme then Hub.applyTheme() end
 	elseif id == "esp" then setEsp(value)
 	elseif id == "espDistance" or id == "espMinConf" then applyEsp() end
 end
 
-local auction = ui:Tab("Auction")
-auction:Section("Bidding")
-auction:Toggle({ Id = "autoBid", Text = "Auto bid", Hint = "Bids whenever you are outbid", Default = D("autoBid", false) })
-auction:Number({ Id = "maxBid", Text = "Max bid", Hint = "0 = no limit", Default = D("maxBid", 0), Min = 0, Prefix = "$" })
-auction:Number({ Id = "blueMaxBid", Text = "Max bid with an outlined item", Hint = "Ignores lot value; 0 = same as max bid", Default = D("blueMaxBid", 0), Min = 0, Prefix = "$" })
-auction:Number({ Id = "keepCash", Text = "Always keep cash", Default = D("keepCash", 0), Min = 0, Prefix = "$" })
-auction:Number({ Id = "bidDelay", Text = "Bid delay", Default = D("bidDelay", 0.35), Min = 0.05, Max = 3, Suffix = "s" })
-auction:Number({ Id = "bidPctOfValue", Text = "Max bid as % of lot value", Hint = "Uses the item reveal estimate; 0 = off", Default = D("bidPctOfValue", 0), Min = 0, Max = 1000, Suffix = "%" })
-auction:Section("Lot filter")
-auction:Toggle({ Id = "lotFilter", Text = "Check lots before bidding", Hint = "Lots with an outlined item always pass", Default = D("lotFilter", false) })
-auction:Number({ Id = "minStartBid", Text = "Starting bid at least", Hint = "0 = any", Default = D("minStartBid", 0), Min = 0, Prefix = "$" })
-auction:List({ Id = "lotMuts", Text = "Lot has a mutation", Hint = "At least one item with any of these", Multi = true, Options = mutationNames, Default = D("lotMuts", {}), Empty = "Any" })
-auction:Toggle({ Id = "leaveFailed", Text = "Leave lots that fail", Hint = "Moves on at once; skips that garage 5 min (no fee refund)", Default = D("leaveFailed", true) })
-auction:Section("Item reveal")
-auction:Toggle({ Id = "esp", Text = "Item reveal ESP", Hint = "Names hidden items and X-rayed boxes", Default = D("esp", false) })
-auction:Number({ Id = "espDistance", Text = "Label distance", Default = D("espDistance", 150), Min = 50, Max = 500, Suffix = " studs" })
-auction:Number({ Id = "espMinConf", Text = "Minimum match confidence", Default = D("espMinConf", 25), Min = 0, Max = 100, Suffix = "%" })
-local lotInfo = auction:Info("Lot: -")
-auction:Section("Airdrops")
-auction:Toggle({ Id = "airdropAlerts", Text = "Airdrop alerts", Hint = "Pop-up when crates fall and land", Default = D("airdropAlerts", true) })
-auction:Toggle({ Id = "airdropMarkers", Text = "Airdrop markers", Hint = "Countdown label on each crate", Default = D("airdropMarkers", true) })
-auction:Toggle({ Id = "autoAirdrop", Text = "Auto open airdrops", Hint = "Needs " .. money(AIR_MIN_WORTH) .. " net worth; before normal auctions", Default = D("autoAirdrop", false) })
-local airInfo = auction:Info("Airdrops: none right now")
-auction:Section("Where")
-auction:List({ Id = "areas", Text = "Areas", Hint = "Where to open auctions", Multi = true, Options = areaNames, Default = D("areas", {}), Empty = "All" })
-auction:Choice({ Id = "garagePick", Text = "Garage choice", Options = { "Nearest", "Cheapest", "Priciest" }, Default = D("garagePick", "Nearest") })
-auction:Number({ Id = "maxEntry", Text = "Max entry fee", Hint = "0 = any", Default = D("maxEntry", 0), Min = 0, Prefix = "$" })
-auction:Toggle({ Id = "autoAuction", Text = "Auto open auctions", Hint = "Opens the next garage when you are free", Default = D("autoAuction", false) })
-auction:Toggle({ Id = "bringCar", Text = "Bring car to auctions", Hint = "Parks your car outside the garage before opening it", Default = D("bringCar", false) })
-auction:Button({ Text = "Quick open auction", Action = "Open", Callback = function()
-	if A.active then ui:SetStatus("Already in an auction", "ok"); return end
-	local ok, err = runBody("quick open", joinAuction)
-	if not ok then Auto.status = "Open failed: " .. tostring(err) end
-end })
-auction:Button({ Text = "Leave current auction", Action = "Leave", Callback = function() invoke(Rm.LeaveAuction) end })
-local auctionInfo = auction:Info("Waiting for auction")
-
-local itemsTab = ui:Tab("Items")
-itemsTab:Section("After winning")
-itemsTab:Toggle({ Id = "autoTake", Text = "Auto take items", Hint = "Adds won items to your vehicle", Default = D("autoTake", false) })
-itemsTab:Number({ Id = "minTake", Text = "Minimum value to take", Hint = "Cheaper items are left behind", Default = D("minTake", 0), Min = 0, Prefix = "$" })
-itemsTab:Toggle({ Id = "takeBlue", Text = "Always take outlined items", Hint = "Blue or white outline; ignores the minimum", Default = D("takeBlue", true) })
-itemsTab:List({ Id = "takeMuts", Text = "Always take mutations", Hint = "Ignores the minimum for these", Multi = true, Options = mutationNames, Default = D("takeMuts", {}), Empty = "None" })
-itemsTab:List({ Id = "takeNames", Text = "Always take", Hint = "These items, ignoring the minimum", Multi = true, Options = itemNames, Default = D("takeNames", {}), Empty = "None" })
-itemsTab:Toggle({ Id = "autoOpen", Text = "Auto open boxes", Default = D("autoOpen", false) })
-itemsTab:Toggle({ Id = "autoRepair", Text = "Auto repair", Hint = "Wrench on won items, plus repair shop slots", Default = D("autoRepair", false) })
-itemsTab:Section("Keep (favorite)")
-itemsTab:Toggle({ Id = "autoFav", Text = "Auto favorite", Hint = "Kept items are never listed or sold", Default = D("autoFav", false) })
-local keepInfo = itemsTab:Info("-")
-itemsTab:Number({ Id = "favGearMin", Text = "Gear minimum price", Hint = "Keep gear worth at least this; 0 = off", Default = D("favGearMin", 0), Min = 0, Prefix = "$" })
-itemsTab:List({ Id = "favGearMuts", Text = "Gear mutations", Hint = "Keep gear with any of these, at any price", Multi = true, Options = mutationNames, Default = D("favGearMuts", {}), Empty = "None" })
-itemsTab:Toggle({ Id = "favGavel", Text = "Gavel", Hint = "Keep Gavel trophies", Default = D("favGavel", false) })
-itemsTab:List({ Id = "favGavelMuts", Text = "Gavel mutations", Hint = "Only gavels with any of these; none = all", Multi = true, Options = mutationNames, Default = D("favGavelMuts", {}), Empty = "Any" })
-itemsTab:List({ Id = "favItems", Text = "Always keep", Hint = "These items at any value", Multi = true, Options = itemNames, Default = D("favItems", {}), Empty = "None" })
-itemsTab:Button({ Text = "Favorite matching items now", Action = "Run", Callback = function() runItems("favorite", favoritePass) end })
-local itemsInfo = itemsTab:Info("-")
-
-local plotTab = ui:Tab("Plot")
-plotTab:Section("Shelves")
-plotTab:Toggle({ Id = "autoList", Text = "Auto list on shelves", Hint = "Fills free slots with unfavorited items", Default = D("autoList", false) })
-plotTab:Number({ Id = "listMin", Text = "Only list items worth at least", Hint = "0 = no minimum", Default = D("listMin", 0), Min = 0, Prefix = "$" })
-plotTab:Number({ Id = "listMax", Text = "Only list items worth at most", Hint = "0 = no maximum", Default = D("listMax", 0), Min = 0, Prefix = "$" })
-plotTab:Button({ Text = "Fill shelves now", Action = "Fill", Callback = function() runItems("list", listPass) end })
+-- Actions used by buttons on several tabs. Each takes the lock it needs.
 local function goToPlot()
 	if not Rm.TeleportToPlot then return end
 	runBody("plot teleport", function()
@@ -2010,47 +2496,317 @@ local function goToPlot()
 	end)
 	ui:SetStatus("Teleported to your plot", "ok")
 end
-plotTab:Button({ Text = "Go to my plot", Action = "Go", Callback = goToPlot })
-plotTab:Section("Vehicle")
-plotTab:Toggle({ Id = "autoUnload", Text = "Auto unload at plot", Hint = "Pauses auctions and unloads when cargo is high", Default = D("autoUnload", false) })
-plotTab:Number({ Id = "dumpAt", Text = "Unload when cargo reaches", Hint = "Auctions resume 30 points below this", Default = D("dumpAt", 85), Min = 40, Max = 100, Suffix = "%" })
-plotTab:Toggle({ Id = "unloadAnywhere", Text = "Try unloading without moving", Hint = "Falls back to driving to the plot if refused", Default = D("unloadAnywhere", true) })
 local function unloadNow()
 	if Locks.body.owner then ui:SetStatus("Unload queued after " .. Locks.body.owner, "busy") end
 	local ok, err = runBody("unload", dumpStep, true)
 	if not ok then Auto.status = "Unload error: " .. tostring(err) end
 end
-plotTab:Button({ Text = "Unload vehicle now", Action = "Unload", Callback = unloadNow })
-local plotInfo = plotTab:Info("-")
+local function quickOpen()
+	if A.active then ui:SetStatus("Already in an auction", "ok"); return end
+	local ok, err = runBody("quick open", joinAuction)
+	if not ok then Auto.status = "Open failed: " .. tostring(err) end
+end
+local function fillShelves() runItems("list", listPass) end
+local function favoriteNow() runItems("favorite", favoritePass) end
+local function leaveAuction() invoke(Rm.LeaveAuction) end
 
--- Top bar: one button per shop screen, plus your plot.
-local SHOP_LOOK = {
-	RepairShop = { "🔧", "Repair" }, LocksmithShop = { "🔑", "Locksmith" }, WashShop = { "🧼", "Wash" },
-	CleaningShop = { "🧴", "Sprays" }, GradingShop = { "🏅", "Grading" }, VehicleDealership = { "🚗", "Cars" },
-	TrailerShop = { "🚚", "Trailers" }, EnergyShop = { "☕", "Drinks" }, Clubs = { "👥", "Clubs" },
-	PawnShop = { "💰", "Pawn" }, Authentication = { "🔍", "Authenticate" },
+local function unloadScript()
+	ui:Confirm({
+		Title = "Unload the hub?",
+		Text = "Stops every feature and removes the window. Your settings are kept for next time.",
+		Confirm = "Unload", Danger = true,
+		Callback = function() Hub.stop() end,
+	})
+end
+
+---------------------------------------------------------------------------
+-- Admin safety
+---------------------------------------------------------------------------
+-- The game marks staff with player attributes; group roles are a fallback.
+local STAFF_ATTRS = { "IsAdmin", "HasAbsoluteZeroAdminRole", "HasAbsoluteZeroModeratorRole" }
+local EXTRA_ATTRS = { "HasAbsoluteZeroTesterRole", "HasAbsoluteZeroContentCreatorRole" }
+local STAFF_WORDS = { "admin", "moderator", "mod ", "developer", "dev", "owner", "staff", "manager", "founder" }
+-- everything that acts in the game; the reveal only draws labels for you
+local GUARDED = { "autoAuction", "autoBid", "autoTake", "autoUnload", "autoFav", "autoList", "autoOpen",
+	"autoRepair", "autoAirdrop", "autoSafe", "noclip", "wsOn", "jpOn", "infJump" }
+local GROUP_ID = game.CreatorType == Enum.CreatorType.Group and game.CreatorId or nil
+local groupRoles = {}
+
+local function staffReason(p)
+	if p == LP then return nil end
+	for _, a in ipairs(STAFF_ATTRS) do if p:GetAttribute(a) == true then return "staff" end end
+	if S.adminExtra then
+		for _, a in ipairs(EXTRA_ATTRS) do if p:GetAttribute(a) == true then return "tester/creator" end end
+	end
+	local role = groupRoles[p]
+	if type(role) == "string" then
+		local l = role:lower() .. " "
+		for _, w in ipairs(STAFF_WORDS) do if l:find(w, 1, true) then return role end end
+	end
+	if game.CreatorType == Enum.CreatorType.User and p.UserId == game.CreatorId then return "game owner" end
+	return nil
+end
+
+local function staffNames(list)
+	local names = {}
+	for _, s in ipairs(list) do names[#names + 1] = string.format("%s (%s)", s.player.DisplayName, s.why) end
+	return table.concat(names, ", ")
+end
+
+local function pauseFeatures()
+	Safety.snapshot = {}
+	for _, k in ipairs(GUARDED) do
+		if S[k] then Safety.snapshot[k] = true; ui:SetSwitch(k, false) end
+	end
+	Safety.paused = true
+	local _, _, hum = getChar()
+	if hum then
+		hum.WalkSpeed = 16
+		if hum.UseJumpPower then hum.JumpPower = 50 else hum.JumpHeight = 7.2 end
+	end
+end
+
+local function restoreFeatures()
+	Safety.paused = false
+	for k in pairs(Safety.snapshot or {}) do ui:SetSwitch(k, true) end
+	Safety.snapshot = nil
+end
+
+local safetyAlert
+local function askOverride()
+	ui:Confirm({
+		Title = "Run features with an admin here?",
+		Text = "Staff in this server: " .. staffNames(Safety.staff) .. ". Using automation while they watch can get your account banned.",
+		Confirm = "Override", Danger = true,
+		Callback = function()
+			Safety.override = true
+			restoreFeatures()
+			if safetyAlert then safetyAlert.Close(); safetyAlert = nil end
+			ui:Notify("Storage Hunters", "Override on: features run even with an admin here.", 6)
+		end,
+	})
+end
+
+local function pauseAgain()
+	Safety.override = false
+	if #Safety.staff > 0 and not Safety.paused then pauseFeatures() end
+end
+
+local function checkStaff()
+	if not Hub.alive then return end
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		local why = staffReason(p)
+		if why then list[#list + 1] = { player = p, why = why } end
+	end
+	local before = #Safety.staff
+	Safety.staff = list
+	if #list > 0 then
+		if S.adminGuard and not Safety.paused and not Safety.override then
+			pauseFeatures()
+			ui:Notify("Storage Hunters", "Admin in server: " .. staffNames(list) .. ". Features paused.", 8)
+			safetyAlert = ui:Alert({
+				Title = "Admin in this server",
+				Text = staffNames(list) .. "\nAll features are paused and anything running was stopped. They switch back on when the admin leaves.",
+				Buttons = {
+					{ Text = "Keep paused" },
+					{ Text = "Override", Primary = true, Callback = askOverride },
+				},
+			})
+		elseif safetyAlert and #list ~= before then
+			safetyAlert.SetText(staffNames(list) .. "\nAll features are paused and anything running was stopped. They switch back on when the admin leaves.")
+		end
+	else
+		if Safety.paused then
+			restoreFeatures()
+			ui:Notify("Storage Hunters", "The admin left. Your features are back on.", 6)
+		end
+		Safety.override = false
+		if safetyAlert then safetyAlert.Close(); safetyAlert = nil end
+	end
+end
+
+local function watchPlayer(p)
+	if p == LP then return end
+	for _, a in ipairs(STAFF_ATTRS) do table.insert(ui.conns, p:GetAttributeChangedSignal(a):Connect(checkStaff)) end
+	for _, a in ipairs(EXTRA_ATTRS) do table.insert(ui.conns, p:GetAttributeChangedSignal(a):Connect(checkStaff)) end
+	if GROUP_ID then
+		task.spawn(function()
+			local ok, role = pcall(p.GetRoleInGroup, p, GROUP_ID)
+			if ok then groupRoles[p] = role; checkStaff() end
+		end)
+	end
+end
+for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
+table.insert(ui.conns, Players.PlayerAdded:Connect(function(p) watchPlayer(p); checkStaff() end))
+table.insert(ui.conns, Players.PlayerRemoving:Connect(function(p)
+	groupRoles[p] = nil
+	task.defer(checkStaff)
+end))
+
+---------------------------------------------------------------------------
+-- Home: what runs. Each step of the loop with a live line, plus status.
+---------------------------------------------------------------------------
+local home = ui:Tab("Home")
+home:Section("Your loop")
+local steps = {
+	find = home:Step({ Id = "autoAuction", Text = "Find auctions", Default = D("autoAuction", false) }),
+	bid = home:Step({ Id = "autoBid", Text = "Bid", Default = D("autoBid", false) }),
+	take = home:Step({ Id = "autoTake", Text = "Take loot", Default = D("autoTake", false) }),
+	unload = home:Step({ Id = "autoUnload", Text = "Unload at plot", Default = D("autoUnload", false) }),
+	keep = home:Step({ Id = "autoFav", Text = "Keep favorites", Default = D("autoFav", false) }),
+	safe = home:Step({ Id = "autoSafe", Text = "Open safes", Default = D("autoSafe", false) }),
+	sell = home:Step({ Id = "autoList", Text = "Sell on shelves", Default = D("autoList", false) }),
+}
+home:Actions({
+	{ Text = "Open auction", Callback = quickOpen },
+	{ Text = "Unload", Callback = unloadNow },
+	{ Text = "Fill shelves", Callback = fillShelves },
+})
+home:Actions({
+	{ Text = "Go to my plot", Callback = goToPlot },
+	{ Text = "Leave auction", Callback = leaveAuction },
+})
+home:Section("Right now")
+local cargoMeter = home:Meter("Cargo")
+local bagMeter = home:Meter("Inventory")
+local homeInfo = home:Info("-")
+
+---------------------------------------------------------------------------
+-- Auction: how to find, judge and bid on auctions.
+---------------------------------------------------------------------------
+local auction = ui:Tab("Auction")
+auction:Section("Bidding")
+local auctionInfo = auction:Info("Waiting for auction")
+auction:Number({ Id = "maxBid", Text = "Max bid", Hint = "0 = no limit", Default = D("maxBid", 0), Min = 0, Prefix = "$" })
+auction:Number({ Id = "blueMaxBid", Text = "Max bid if outlined item", Hint = "Ignores lot value; 0 = same as max bid", Default = D("blueMaxBid", 0), Min = 0, Prefix = "$" })
+auction:Number({ Id = "keepCash", Text = "Always keep cash", Hint = "Never spends below this", Default = D("keepCash", 0), Min = 0, Prefix = "$" })
+auction:Section("Where to go")
+auction:List({ Id = "areas", Text = "Areas", Hint = "None picked = all areas", Multi = true, Options = areaNames, Default = D("areas", {}), Empty = "All" })
+auction:Choice({ Id = "garagePick", Text = "Which garage first", Options = { "Nearest", "Cheapest", "Priciest" }, Default = D("garagePick", "Nearest") })
+auction:Number({ Id = "maxEntry", Text = "Max entry fee", Hint = "0 = any", Default = D("maxEntry", 0), Min = 0, Prefix = "$" })
+auction:Toggle({ Id = "bringCar", Text = "Bring my car", Hint = "Parks it by the garage so loot loads fast", Default = D("bringCar", false) })
+auction:Section("Skip bad lots")
+auction:Toggle({ Id = "lotFilter", Text = "Check lots first", Hint = "Outlined items and airdrops always pass", Default = D("lotFilter", false) })
+auction:List({ Id = "lotMuts", Text = "Must have a mutation", Hint = "Any one of these", Multi = true, Options = mutationNames, Default = D("lotMuts", {}), Empty = "Any" })
+auction:Number({ Id = "minStartBid", Text = "Starting bid at least", Hint = "0 = any", Default = D("minStartBid", 0), Min = 0, Prefix = "$" })
+auction:Section("See hidden items")
+auction:Toggle({ Id = "esp", Text = "Item reveal", Hint = "Labels hidden items and X-rayed boxes", Default = D("esp", false) })
+local lotInfo = auction:Info("Lot: -")
+auction:Section("Airdrops")
+auction:Toggle({ Id = "airdropAlerts", Text = "Alerts", Hint = "Pop-up when crates fall and land", Default = D("airdropAlerts", true) })
+auction:Toggle({ Id = "airdropMarkers", Text = "Markers", Hint = "Countdown over each crate", Default = D("airdropMarkers", true) })
+auction:Toggle({ Id = "autoAirdrop", Text = "Open airdrops", Hint = "Needs " .. money(AIR_MIN_WORTH) .. " net worth", Default = D("autoAirdrop", false) })
+local airInfo = auction:Info("Airdrops: none right now")
+auction:Section("More options", { Collapsible = true, Collapsed = true })
+auction:Number({ Id = "bidDelay", Text = "Bid delay", Default = D("bidDelay", 0.35), Min = 0.05, Max = 3, Suffix = "s" })
+auction:Number({ Id = "bidPctOfValue", Text = "Max bid as % of lot value", Hint = "Uses item reveal; 0 = off", Default = D("bidPctOfValue", 0), Min = 0, Max = 1000, Suffix = "%" })
+auction:Toggle({ Id = "leaveFailed", Text = "Leave lots that fail", Hint = "Moves on at once; skips that garage 5 min", Default = D("leaveFailed", true) })
+auction:Number({ Id = "espDistance", Text = "Reveal label distance", Default = D("espDistance", 150), Min = 50, Max = 500, Suffix = " studs" })
+auction:Number({ Id = "espMinConf", Text = "Reveal match confidence", Default = D("espMinConf", 25), Min = 0, Max = 100, Suffix = "%" })
+
+---------------------------------------------------------------------------
+-- Loot: what to take after winning and what to keep.
+---------------------------------------------------------------------------
+local loot = ui:Tab("Loot")
+loot:Section("What to take")
+loot:Number({ Id = "minTake", Text = "Take items worth at least", Hint = "Cheaper ones stay behind", Default = D("minTake", 0), Min = 0, Prefix = "$" })
+loot:Toggle({ Id = "takeBlue", Text = "Always take outlined items", Hint = "Blue or white outline", Default = D("takeBlue", true) })
+loot:List({ Id = "takeMuts", Text = "Always take mutations", Hint = "At any value", Multi = true, Options = mutationNames, Default = D("takeMuts", {}), Empty = "None" })
+loot:List({ Id = "takeNames", Text = "Always take these items", Hint = "At any value", Multi = true, Options = itemNames, Default = D("takeNames", {}), Empty = "None" })
+loot:Section("While taking")
+loot:Toggle({ Id = "autoOpen", Text = "Open boxes", Hint = "Crates you won are opened first", Default = D("autoOpen", false) })
+loot:Toggle({ Id = "autoRepair", Text = "Repair broken items", Hint = "Wrench on loot, plus repair shop slots", Default = D("autoRepair", false) })
+local itemsInfo = loot:Info("-")
+loot:Section("What to keep")
+local keepInfo = loot:Info("-")
+loot:Number({ Id = "favGearMin", Text = "Gear worth at least", Hint = "Wearables, boards, car parts; 0 = off", Default = D("favGearMin", 0), Min = 0, Prefix = "$" })
+loot:List({ Id = "favGearMuts", Text = "Gear with a mutation", Hint = "At any price", Multi = true, Options = mutationNames, Default = D("favGearMuts", {}), Empty = "None" })
+loot:Toggle({ Id = "favGavel", Text = "Gavel trophies", Default = D("favGavel", false) })
+loot:List({ Id = "favGavelMuts", Text = "Gavel mutations", Hint = "None picked = every gavel", Multi = true, Options = mutationNames, Default = D("favGavelMuts", {}), Empty = "Any" })
+loot:List({ Id = "favItems", Text = "Always keep these items", Hint = "At any value", Multi = true, Options = itemNames, Default = D("favItems", {}), Empty = "None" })
+loot:Actions({ { Text = "Favorite matching items now", Callback = favoriteNow } })
+loot:Section("Safes and vaults")
+loot:Toggle({ Id = "safeLocksmith", Text = "Use the Locksmith too", Hint = "For safes your lockpick is not good enough for", Default = D("safeLocksmith", true) })
+local safeInfo = loot:Info("Turn on Open safes on Home")
+loot:Actions({ { Text = "Open safes now", Callback = function() runItems("open safes", Safe.pass) end } })
+
+---------------------------------------------------------------------------
+-- Stats: what the hub did this session.
+---------------------------------------------------------------------------
+local statsTab = ui:Tab("Stats")
+statsTab:Section("Session")
+local statRows = {
+	time = statsTab:Stat("Running for"),
+	worthStart = statsTab:Stat("Net worth at start"),
+	worthNow = statsTab:Stat("Net worth now"),
+	worthGain = statsTab:Stat("Net worth gained"),
+}
+statsTab:Section("Auctions")
+statRows.opened = statsTab:Stat("Auctions opened")
+statRows.won = statsTab:Stat("Auctions won")
+statRows.bids = statsTab:Stat("Paid for wins")
+statRows.fees = statsTab:Stat("Entry fees")
+statRows.loot = statsTab:Stat("Loot value claimed")
+statsTab:Section("Items")
+statRows.taken = statsTab:Stat("Items taken")
+statRows.mutated = statsTab:Stat("Mutated items gained")
+statRows.safes = statsTab:Stat("Safes unlocked")
+statRows.favorited = statsTab:Stat("Favorited")
+statRows.listed = statsTab:Stat("Listed on shelves")
+statRows.sales = statsTab:Stat("Shelf sales")
+statsTab:Section("Money handled")
+statRows.handled = statsTab:Stat("Total moved by the hub")
+statsTab:Actions({ { Text = "Reset stats", Callback = function()
+	Stats.startedAt, Stats.startNetWorth = os.clock(), nil
+	Stats.won, Stats.bidsPaid, Stats.entryFees, Stats.lootValue = 0, 0, 0, 0
+	Stats.mutated, Stats.safes, Stats.shelfSales, Stats.salesCount = 0, 0, 0, 0
+	Auto.joined, Auto.picked, Auto.favorited, Auto.listed = 0, 0, 0, 0
+end } })
+
+---------------------------------------------------------------------------
+-- Shop: selling on your plot and unloading.
+---------------------------------------------------------------------------
+local shop = ui:Tab("Shop")
+shop:Section("What to sell")
+shop:Number({ Id = "listMin", Text = "Sell items worth at least", Hint = "0 = no minimum", Default = D("listMin", 0), Min = 0, Prefix = "$" })
+shop:Number({ Id = "listMax", Text = "Sell items worth at most", Hint = "0 = no maximum", Default = D("listMax", 0), Min = 0, Prefix = "$" })
+local plotInfo = shop:Info("-")
+shop:Actions({ { Text = "Fill shelves now", Callback = fillShelves }, { Text = "Go to my plot", Callback = goToPlot } })
+shop:Section("Unloading")
+shop:Number({ Id = "dumpAt", Text = "Unload when cargo reaches", Hint = "Auctions resume 30 points lower", Default = D("dumpAt", 85), Min = 40, Max = 100, Suffix = "%" })
+shop:Toggle({ Id = "unloadAnywhere", Text = "Unload without moving", Hint = "Drives to your plot only if refused", Default = D("unloadAnywhere", true) })
+shop:Actions({ { Text = "Unload now", Callback = unloadNow } })
+
+-- Top bar: Plot and Unload first, then one button per shop screen.
+local SHOP_LABEL = {
+	RepairShop = "Repair", LocksmithShop = "Locksmith", WashShop = "Wash", CleaningShop = "Sprays",
+	GradingShop = "Grading", VehicleDealership = "Cars", TrailerShop = "Trailers", EnergyShop = "Drinks",
+	Clubs = "Clubs", PawnShop = "Pawn", Authentication = "Authenticate",
 }
 local barItems = {
-	{ Icon = "🏠", Label = "Plot", Callback = goToPlot },
-	{ Icon = "📦", Label = "Unload", Callback = unloadNow },
+	{ Label = "Plot", Accent = true, Callback = goToPlot },
+	{ Label = "Unload", Accent = true, Callback = unloadNow },
 }
 for _, name in ipairs(shopNames) do
-	local look = SHOP_LOOK[shopScreens[name].screen] or { "🛒", name:match("^(.-) %(") or name }
-	barItems[#barItems + 1] = { Icon = look[1], Label = look[2], Callback = function()
+	local text = SHOP_LABEL[shopScreens[name].screen] or name:match("^(.-) %(") or name
+	barItems[#barItems + 1] = { Label = text, Callback = function()
 		local ok, err = openShop(name)
-		if not ok then ui:SetStatus("Could not open " .. look[2] .. ": " .. tostring(err)) end
+		if not ok then ui:SetStatus("Could not open " .. text .. ": " .. tostring(err)) end
 	end }
 end
 local quickBar = ui:Bar(barItems)
 
-local moveTab = ui:Tab("Move")
-moveTab:Section("Shops")
-moveTab:Toggle({ Id = "shopBar", Text = "Shop bar at the top", Hint = "One button per shop screen", Default = D("shopBar", true) })
+---------------------------------------------------------------------------
+-- Player: getting around, movement and the hub itself.
+---------------------------------------------------------------------------
+local playerTab = ui:Tab("Player")
+playerTab:Section("Shops")
+playerTab:Toggle({ Id = "shopBar", Text = "Shop bar at the top", Hint = "One button per shop screen", Default = D("shopBar", true) })
 quickBar.Visible = S.shopBar
-moveTab:Section("Teleport")
-moveTab:Button({ Text = "Go to my plot", Action = "Go", Callback = goToPlot })
-local placePick = moveTab:List({ Id = "tpPlace", Text = "Place", Multi = false, Options = placeNames, Empty = "Pick one" })
-moveTab:Button({ Text = "Go to place", Action = "Go", Callback = function()
+playerTab:Section("Teleport")
+local placePick = playerTab:List({ Id = "tpPlace", Text = "Place", Multi = false, Options = placeNames, Empty = "Pick one" })
+playerTab:Button({ Text = "Go to place", Action = "Go", Callback = function()
 	local get = S.tpPlace and places[S.tpPlace]
 	if not get then ui:SetStatus("Pick a place first"); return end
 	local ok, moved = runBody("teleport", function() return tpTo(get()) end)
@@ -2062,22 +2818,116 @@ local function playerNames()
 	table.sort(list)
 	return list
 end
-moveTab:List({ Id = "tpPlayer", Text = "Player", Multi = false, Options = playerNames, Empty = "Pick one" })
-moveTab:Button({ Text = "Go to player", Action = "Go", Callback = function()
+playerTab:List({ Id = "tpPlayer", Text = "Player", Multi = false, Options = playerNames, Empty = "Pick one" })
+playerTab:Button({ Text = "Go to player", Action = "Go", Callback = function()
 	local p = S.tpPlayer and Players:FindFirstChild(S.tpPlayer)
 	local hrp = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
 	if hrp then runBody("teleport", tpTo, hrp.Position + Vector3.new(3, 0, 0)) else ui:SetStatus("Player has no character") end
 end })
-moveTab:Section("Movement")
-moveTab:Toggle({ Id = "wsOn", Text = "Walk speed", Default = D("wsOn", false) })
-moveTab:Number({ Id = "ws", Text = "Speed", Default = D("ws", 32), Min = 16, Max = 150 })
-moveTab:Toggle({ Id = "jpOn", Text = "Jump power", Default = D("jpOn", false) })
-moveTab:Number({ Id = "jp", Text = "Power", Default = D("jp", 75), Min = 50, Max = 250 })
-moveTab:Toggle({ Id = "infJump", Text = "Infinite jump", Default = D("infJump", false) })
-moveTab:Toggle({ Id = "noclip", Text = "Noclip", Default = D("noclip", false) })
-moveTab:Toggle({ Id = "antiAfk", Text = "Anti AFK", Default = D("antiAfk", true) })
+playerTab:Section("Movement")
+playerTab:Toggle({ Id = "wsOn", Text = "Walk speed", Default = D("wsOn", false) })
+playerTab:Number({ Id = "ws", Text = "Speed", Default = D("ws", 32), Min = 16, Max = 150 })
+playerTab:Toggle({ Id = "jpOn", Text = "Jump power", Default = D("jpOn", false) })
+playerTab:Number({ Id = "jp", Text = "Power", Default = D("jp", 75), Min = 50, Max = 250 })
+playerTab:Toggle({ Id = "infJump", Text = "Infinite jump", Default = D("infJump", false) })
+playerTab:Toggle({ Id = "noclip", Text = "Noclip", Default = D("noclip", false) })
+playerTab:Toggle({ Id = "antiAfk", Text = "Anti AFK", Default = D("antiAfk", true) })
+playerTab:Section("Admin safety")
+playerTab:Toggle({ Id = "adminGuard", Text = "Pause when an admin joins", Hint = "Stops everything until they leave", Default = D("adminGuard", true) })
+playerTab:Toggle({ Id = "adminExtra", Text = "Count testers and creators", Hint = "Not just admins and moderators", Default = D("adminExtra", false) })
+local safetyInfo = playerTab:Info("No staff in this server")
+playerTab:Actions({ { Text = "Override", Callback = function()
+	if #Safety.staff == 0 then ui:SetStatus("No admin here, nothing to override", "ok") else askOverride() end
+end }, { Text = "Pause again", Callback = pauseAgain } })
+playerTab:Section("Interface")
+local themePick = playerTab:Choice({ Id = "theme", Text = "Theme", Options = { "Black Teal", "Noir", "Original", "Custom" }, Default = D("theme", "Original") })
+local customColors = {
+	playerTab:ColorInput({ Id = "customBg", Text = "Background", Hint = "Hex colour, like #101214", Default = D("customBg", "#101214") }),
+	playerTab:ColorInput({ Id = "customAccent", Text = "Accent", Hint = "Switches, buttons, highlights", Default = D("customAccent", "#2EC4B6") }),
+	playerTab:ColorInput({ Id = "customText", Text = "Text", Default = D("customText", "#E8EEF0") }),
+}
+local function applyTheme()
+	local name = S.theme or "Original"
+	local theme
+	if name == "Custom" then
+		theme = Kit.CustomTheme(Kit.HexToColor(S.customBg) or Color3.fromRGB(16, 18, 20),
+			Kit.HexToColor(S.customAccent) or Color3.fromRGB(46, 196, 182),
+			Kit.HexToColor(S.customText) or Color3.fromRGB(232, 238, 240))
+	else
+		theme = Kit.Themes[name] or Kit.Themes.Original
+	end
+	task.wait(0.2) -- let any button animation that started with the old colours finish
+	ui:SetTheme(theme)
+	themePick.Set(name, false) -- repaint the picker in the new colours
+	for _, c in ipairs(customColors) do c.row.Visible = name == "Custom" end
+end
+Hub.applyTheme = applyTheme
+playerTab:Section("Keybinds")
+playerTab:Info("Click the small box next to any switch, then press a key. Backspace clears it. Insert shows or hides this window.")
+playerTab:Section("Hub")
+playerTab:Actions({ { Text = "Unload script", Callback = unloadScript } })
 S.tpPlace, S.tpPlayer = nil, nil -- not worth remembering between sessions
 placePick.Set(nil, false)
+
+-- Live lines on Home: what each step is set to, and which one is working.
+local function refreshHome()
+	local areas = #(S.areas or {}) > 0 and table.concat(S.areas, ", ") or "All areas"
+	steps.find.SetDetail(Auto.dumping and "Paused while unloading" or (areas .. ", " .. string.lower(S.garagePick or "nearest") .. " first"))
+	steps.bid.SetDetail((S.maxBid > 0 and ("Up to " .. money(S.maxBid)) or "No max bid") .. (S.lotFilter and ", checks lots" or ""))
+	local take = "Worth " .. money(S.minTake) .. "+"
+	if S.takeBlue then take ..= ", outlined" end
+	if #(S.takeMuts or {}) > 0 then take ..= ", " .. #S.takeMuts .. " mutation(s)" end
+	if #(S.takeNames or {}) > 0 then take ..= ", " .. #S.takeNames .. " item(s)" end
+	steps.take.SetDetail(take)
+	steps.unload.SetDetail("At " .. tostring(S.dumpAt) .. "% cargo" .. (Auto.dumping and ", unloading now" or ""))
+	steps.keep.SetDetail(keepRulesText())
+	steps.safe.SetDetail(Safe.note or (S.safeLocksmith and "Lockpick, then Locksmith" or "Lockpick only"))
+	safeInfo(Safe.note or "Waiting for safes in your inventory")
+	local range
+	if S.listMin > 0 and S.listMax > 0 then range = money(S.listMin) .. " to " .. money(S.listMax)
+	elseif S.listMin > 0 then range = money(S.listMin) .. "+"
+	elseif S.listMax > 0 then range = "up to " .. money(S.listMax)
+	else range = "any value" end
+	steps.sell.SetDetail(Auto.listNote and ((Auto.listNote:gsub("^Shelves: ", ""))) or ("Items worth " .. range))
+
+	local busyBody, busyItems = Locks.body.owner or "", Locks.items.owner or ""
+	steps.find.SetActive(Auto.phase == "find" or busyBody == "quick open")
+	steps.bid.SetActive(A.active)
+	steps.take.SetActive(Auto.phase == "take")
+	steps.unload.SetActive(Auto.phase == "unload" or busyBody == "unload" or busyItems == "unload")
+	steps.keep.SetActive(busyItems:find("favorite") ~= nil)
+	steps.sell.SetActive(busyItems:find("list") ~= nil)
+	steps.safe.SetActive(busyItems:find("safe") ~= nil)
+
+	-- Stats tab
+	local worth = netWorth()
+	if worth == math.huge then worth = nil end
+	if not Stats.startNetWorth and worth then Stats.startNetWorth = worth end
+	local secs = math.floor(os.clock() - Stats.startedAt)
+	statRows.time(string.format("%d:%02d:%02d", secs // 3600, (secs % 3600) // 60, secs % 60))
+	statRows.worthStart(Stats.startNetWorth and money(Stats.startNetWorth) or "-")
+	statRows.worthNow(worth and money(worth) or "-")
+	statRows.worthGain((worth and Stats.startNetWorth) and ((worth >= Stats.startNetWorth and "+" or "") .. money(worth - Stats.startNetWorth)) or "-")
+	statRows.opened(Auto.joined)
+	statRows.won(Stats.won)
+	statRows.bids(money(Stats.bidsPaid))
+	statRows.fees(money(Stats.entryFees))
+	statRows.loot(money(Stats.lootValue))
+	statRows.taken(Auto.picked)
+	statRows.mutated(Stats.mutated)
+	statRows.safes(Stats.safes)
+	statRows.favorited(Auto.favorited)
+	statRows.listed(Auto.listed)
+	statRows.sales(string.format("%s (%d)", money(Stats.shelfSales), Stats.salesCount))
+	statRows.handled(money(Stats.bidsPaid + Stats.entryFees + Stats.lootValue + Stats.shelfSales))
+
+	local w, lim = cargoOf(myVehicle())
+	cargoMeter(lim and lim > 0 and w / lim or 0, lim and string.format("%d / %d kg", math.floor(w + 0.5), lim) or "no vehicle")
+	local count, cap = tonumber(LP:GetAttribute("InventoryCount")) or 0, tonumber(LP:GetAttribute("InventoryCap")) or 0
+	bagMeter(cap > 0 and count / cap or 0, string.format("%d / %d", count, cap))
+	homeInfo(string.format("This session: %d auctions, %d bids, %d taken, %d favorited, %d listed",
+		Auto.joined, A.bids, Auto.picked, Auto.favorited, Auto.listed))
+end
 
 ---------------------------------------------------------------------------
 -- Events
@@ -2139,9 +2989,21 @@ end)
 on(Rm.SpawnResult and Rm.SpawnResult.OnClientEvent, function(ok, msg) Auto.spawnResult = { ok = ok, msg = msg } end)
 on(Rm.OfferOverweight and Rm.OfferOverweight.OnClientEvent, function() Auto.overweightAt = os.clock() end)
 
--- a sale frees a shelf slot: fill it again soon
-on(Rm.CashEffect and Rm.CashEffect.OnClientEvent, function()
+-- a sale frees a shelf slot: fill it again soon (and count it)
+on(Rm.CashEffect and Rm.CashEffect.OnClientEvent, function(_, amount)
 	Auto.lastList = math.min(Auto.lastList, os.clock() - 6)
+	if tonumber(amount) then Stats.shelfSales += tonumber(amount); Stats.salesCount += 1 end
+end)
+-- the game's own profit HUD events: price paid on a win, then each item's value
+on(Rm.PickupStart and Rm.PickupStart.OnClientEvent, function(paid)
+	Stats.won += 1
+	Stats.bidsPaid += tonumber(paid) or 0
+end)
+on(Rm.PickupItem and Rm.PickupItem.OnClientEvent, function(value)
+	Stats.lootValue += tonumber(value) or 0
+end)
+on(Rm.FeePaid and Rm.FeePaid.OnClientEvent, function(amount, currency)
+	if currency == nil or currency == "Cash" then Stats.entryFees += tonumber(amount) or 0 end
 end)
 
 on(game:GetService("UserInputService").JumpRequest, function()
@@ -2249,12 +3111,15 @@ local function autoStep()
 		return
 	end
 	if now - Auto.lastAuctionEnd < 3 then Auto.status = "Waiting for auction results"; return end
+	-- Auto.phase tells Home which step is working; the loop clears it after each step
+	Auto.phase = "take"
 	if S.autoOpen and openBoxes() then return end
 	local items = S.autoTake and takeable() or {}
 	local full = vehicleFull(items)
 	if S.autoTake and #items > 0 and not full then takeItems(items); return end
 	local high = full or cargoPct() >= S.dumpAt
 	if S.autoUnload and (Auto.dumping or high) then
+		Auto.phase = "unload"
 		Auto.dumping = true
 		if now - Auto.lastDeposit < 5 then return end -- keep the paused status between rounds
 		Auto.lastDeposit = now
@@ -2262,6 +3127,7 @@ local function autoStep()
 		Auto.dumping = false
 		high = vehicleFull({}) or cargoPct() >= S.dumpAt
 	end
+	Auto.phase = "find"
 	-- airdrop crates vanish after 10 minutes, so they go before normal auctions
 	if S.autoAirdrop and not high and airdropEligible() and nextAirdrop() then
 		openAirdrop()
@@ -2298,6 +3164,7 @@ task.spawn(function()
 				if not done then Auto.listNote = name .. ": " .. tostring(why) end
 			end
 			if S.autoFav and now - Auto.lastFav >= 20 then Auto.lastFav = now; chore("auto favorite", favoritePass) end
+			if S.autoSafe and now - (Auto.lastSafe or 0) >= 6 then Auto.lastSafe = now; chore("open safes", Safe.pass) end
 			if S.autoList and now - Auto.lastList >= 8 then Auto.lastList = now; chore("auto list", listPass) end
 			if S.autoRepair and now - Auto.lastRepair >= 15 then Auto.lastRepair = now; chore("repair shop", repairShopPass) end
 		end)
@@ -2313,6 +3180,7 @@ task.spawn(function()
 		if anyAuto then
 			-- waits its turn if a button (quick open, teleport, unload) is moving you
 			local ok, err = runBody("automation", autoStep)
+			Auto.phase = nil
 			if not ok then Auto.status = "Error: " .. tostring(err) end
 		elseif not Locks.body.owner then
 			Auto.status = A.active and ("In auction" .. (A.hasBlue and " (outlined item in lot)" or "")) or "Idle"
@@ -2352,11 +3220,20 @@ task.spawn(function()
 		auctionInfo(string.format("%s  |  bids sent %d  |  auctions opened %d", A.status, A.bids, Auto.joined))
 		local w, lim = cargoOf(myVehicle())
 		keepInfo(keepSummary())
+		pcall(refreshHome)
 		itemsInfo(string.format("Taken %d, opened %d, repaired %d, favorited %d  |  cargo %.1f/%s",
 			Auto.picked, Auto.opened, Auto.repaired, Auto.favorited, w, lim and tostring(lim) or "-"))
 		plotInfo(string.format("%s  |  listed %d", Auto.listNote or "Shelves: -", Auto.listed))
 		local working = Locks.body.owner or Locks.items.owner
 		ui:SetStatus(Auto.status, working and "busy" or (Auto.status == "Idle" and "idle" or "ok"))
+		-- admin safety: re-check every 5 s as a safety net, and show the state
+		if os.clock() - (Auto.lastStaffCheck or 0) > 5 then Auto.lastStaffCheck = os.clock(); pcall(checkStaff) end
+		if #Safety.staff > 0 then
+			safetyInfo((Safety.override and "Override on. " or (Safety.paused and "Paused. " or "")) .. "Staff here: " .. staffNames(Safety.staff))
+		else
+			safetyInfo("No staff in this server")
+		end
+		if Safety.paused then ui:SetStatus("Paused: admin in server (Player tab to override)", "busy") end
 		task.wait(0.3)
 	end
 end)
@@ -2369,6 +3246,8 @@ function Hub.stop()
 		if S.wsOn then hum.WalkSpeed = 16 end
 		if S.jpOn then if hum.UseJumpPower then hum.JumpPower = 50 else hum.JumpHeight = 7.2 end end
 	end
+	-- if an admin pause switched features off, save them as you had them
+	for k in pairs(Safety.snapshot or {}) do S[k] = true end
 	pcall(function() writefile(SETTINGS_PATH, HttpService:JSONEncode(S)) end)
 	local R = env.UAIAuctionReveal
 	if R and R.headless and R.stop then pcall(R.stop) end
@@ -2379,6 +3258,10 @@ end
 
 Hub.S, Hub.A, Hub.Auto, Hub.ui = S, A, Auto, ui
 Hub.quickBar = quickBar
+Hub.checkStaff = checkStaff
+Hub.Safety = Safety
+applyTheme() -- saved theme, applied once everything is built
+checkStaff() -- now that every switch exists, pause at once if an admin is already here
 if S.esp then setEsp(true) end
 ui:SetStatus("Loaded", "ok")
 return "loaded"
