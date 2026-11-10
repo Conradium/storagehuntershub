@@ -1,12 +1,12 @@
--- Storage Hunters Hub 4.8.3 (Storage Hunters: Open World)
+-- Storage Hunters Hub 4.9.3 (Storage Hunters: Open World)
 -- Made by conradium, commissioned by rsl.
 -- Auto bid, auto open auctions and airdrops, take/open/repair won items, favorites,
--- shelf listing, teleports and movement. Settings are saved.
+-- shelf listing, lost items, mining, event timers, teleports and movement. Settings are saved per account.
 -- Show or hide the window with Insert. Stop: getgenv().SHHub.stop()
 
 local env = getgenv()
 if env.SHHub and type(env.SHHub.stop) == "function" then pcall(env.SHHub.stop) end
-local Hub = { alive = true, version = "4.8.3" }
+local Hub = { alive = true, version = "4.9.3" }
 env.SHHub = Hub
 local Kit = (function()
 ---------------------------------------------------------------------------
@@ -297,6 +297,72 @@ function Kit:Bar(items)
 		end)
 	end
 	return bar
+end
+
+-- A small list pinned to the screen edge (event timers and the like). It
+-- stays up when the window is hidden, sits under the window, and can be
+-- dragged. opts: Title, Empty (text when there are no rows), Position (UDim2),
+-- Width, OnMoved(position). Returns a panel:
+--   panel:SetRows({ { Text = "name", Value = "1:23", State = "live" | "soon" | nil }, ... })
+--   panel:SetVisible(on)
+function Kit:SidePanel(opts)
+	local frame = new("Frame", {
+		Name = "SidePanel", Position = opts.Position or UDim2.fromOffset(12, 96), Active = true,
+		Size = UDim2.fromOffset(opts.Width or 214, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.bg, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 0,
+	}, self.gui)
+	corner(frame, 10)
+	stroke(frame, C.line)
+	new("UIPadding", { PaddingTop = UDim.new(0, 7), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 11), PaddingRight = UDim.new(0, 11) }, frame)
+	new("UIListLayout", { Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder }, frame)
+	label(frame, opts.Title or "", 11, C.faint, FONT_BOLD, { Size = UDim2.new(1, 0, 0, 17), LayoutOrder = 0 })
+	local empty = label(frame, opts.Empty or "-", 12, C.sub, FONT, { Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 1 })
+	local rows = {}
+	local panel = { frame = frame }
+	function panel:SetRows(list)
+		empty.Visible = #list == 0
+		for i, item in ipairs(list) do
+			local r = rows[i]
+			if not r then
+				local f = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = i + 1 }, frame)
+				r = {
+					frame = f,
+					name = label(f, "", 12, C.text, FONT_MED, { Size = UDim2.new(1, -80, 1, 0) }),
+					value = label(f, "", 12, C.sub, FONT_MED, { Position = UDim2.new(1, -78, 0, 0), Size = UDim2.new(0, 78, 1, 0),
+						TextXAlignment = Enum.TextXAlignment.Right }),
+				}
+				rows[i] = r
+			end
+			r.frame.Visible = true
+			r.name.Text = item.Text or ""
+			r.value.Text = item.Value or ""
+			r.name.TextColor3 = item.State == "live" and C.text or C.sub
+			r.value.TextColor3 = (item.State == "live" and C.good) or (item.State == "soon" and C.accent) or C.sub
+		end
+		for i = #list + 1, #rows do rows[i].frame.Visible = false end
+	end
+	function panel:SetVisible(on) frame.Visible = on and true or false end
+
+	-- drag anywhere on the panel; OnMoved gets the new position to save
+	local dragging, startPos, startAt = false, nil, nil
+	table.insert(self.conns, frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startAt = true, frame.Position, input.Position
+		end
+	end))
+	table.insert(self.conns, UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startAt
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(self.conns, UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			if opts.OnMoved then pcall(opts.OnMoved, frame.Position) end
+		end
+	end))
+	return panel
 end
 
 -- Repaints everything already on screen, then makes the new colours current.
@@ -1129,6 +1195,8 @@ local Rm = {
 	PickupStart = remote("Auction", "AuctionPickupStart"),
 	PickupItem = remote("Auction", "AuctionPickupItem"),
 	FeePaid = remote("Auction", "AuctionFeePaid"),
+	Notify = remote("UI", "Notify"),
+	MiningState = remote("Misc", "MiningState"),
 }
 
 local function invoke(rf, ...)
@@ -1183,7 +1251,9 @@ end
 ---------------------------------------------------------------------------
 
 local DIR = "UAI/files/Storage Hunters Open World (98800969324557)"
-local SETTINGS_PATH = DIR .. "/hub_settings.json"
+-- One file per Roblox account, so switching accounts on this PC never runs
+-- (or overwrites) another account's switches. A new account starts with defaults.
+local SETTINGS_PATH = DIR .. "/hub_settings_" .. tostring(LP.UserId) .. ".json"
 if type(makefolder) == "function" and type(isfolder) == "function" then
 	local path = ""
 	for part in DIR:gmatch("[^/]+") do
@@ -1233,7 +1303,7 @@ local spotted = setmetatable({}, { __mode = "k" })
 local Stats = {
 	startedAt = os.clock(), trackedBefore = 0, since = os.date("%d %b %Y, %H:%M"), startNetWorth = nil,
 	won = 0, bidsPaid = 0, entryFees = 0, lootValue = 0, mutated = 0, safes = 0, shelfSales = 0, salesCount = 0,
-	path = DIR .. "/hub_stats.json",
+	path = DIR .. "/hub_stats_" .. tostring(LP.UserId) .. ".json",
 }
 local STAT_FIELDS = { "won", "bidsPaid", "entryFees", "lootValue", "mutated", "safes", "shelfSales", "salesCount" }
 local AUTO_FIELDS = { "joined", "picked", "favorited", "listed" }
@@ -1853,20 +1923,24 @@ end
 -- is a small auction lot (3 items, $2,000 entry) that needs $80M net worth and
 -- disappears 10 minutes after landing. Crates carry the "MilitaryAirdrop"
 -- tag and attributes AirdropState ("falling"/"landed") and AirdropExpiresAt.
-local okAirCfg, AirCfg = pcall(require, Modules:FindFirstChild("MilitaryAirdropConfig"))
-if not okAirCfg or type(AirCfg) ~= "table" then AirCfg = {} end
-local AIR_TAG = AirCfg.Tag or "MilitaryAirdrop"
-local AIR_GARAGE = AirCfg.GarageId or "Camo Airdrop"
-local AIR_ATTR = type(AirCfg.Attributes) == "table" and AirCfg.Attributes or {}
-local AIR_STATE = AIR_ATTR.State or "AirdropState"
-local AIR_EXPIRES = AIR_ATTR.ExpiresAt or "AirdropExpiresAt"
-local airDef = okGarages and type(GarageDefs) == "table" and GarageDefs[AIR_GARAGE] or {}
-local AIR_MIN_WORTH = tonumber(airDef.MinNetWorth) or 0
-local AIR_FEE = type(airDef.EntryCost) == "table" and tonumber(airDef.EntryCost.Max or airDef.EntryCost.Min) or 0
+-- (one table rather than ten locals: the main chunk is near Luau's 200-local limit)
+local Air = {}
+do
+	local ok, cfg = pcall(require, Modules:FindFirstChild("MilitaryAirdropConfig"))
+	Air.cfg = ok and type(cfg) == "table" and cfg or {}
+	Air.TAG = Air.cfg.Tag or "MilitaryAirdrop"
+	Air.GARAGE = Air.cfg.GarageId or "Camo Airdrop"
+	local attrs = type(Air.cfg.Attributes) == "table" and Air.cfg.Attributes or {}
+	Air.STATE = attrs.State or "AirdropState"
+	Air.EXPIRES = attrs.ExpiresAt or "AirdropExpiresAt"
+	local def = okGarages and type(GarageDefs) == "table" and GarageDefs[Air.GARAGE] or {}
+	Air.MIN_WORTH = tonumber(def.MinNetWorth) or 0
+	Air.FEE = type(def.EntryCost) == "table" and tonumber(def.EntryCost.Max or def.EntryCost.Min) or 0
+end
 local CollectionService = game:GetService("CollectionService")
 
 local function airdropTimeLeft(inst)
-	local expires = tonumber(inst:GetAttribute(AIR_EXPIRES))
+	local expires = tonumber(inst:GetAttribute(Air.EXPIRES))
 	return expires and (expires - workspace:GetServerTimeNow()) or nil
 end
 
@@ -1879,7 +1953,7 @@ local function airdropGarage(inst)
 	local pos = okPos and pivot and pivot.Position
 	local best, bestD
 	for _, g in ipairs(root and root:GetChildren() or {}) do
-		if g:GetAttribute("GarageId") == AIR_GARAGE and pos then
+		if g:GetAttribute("GarageId") == Air.GARAGE and pos then
 			local d = (g:GetPivot().Position - pos).Magnitude
 			if d < 80 and (not bestD or d < bestD) then best, bestD = g, d end
 		end
@@ -1889,8 +1963,8 @@ end
 
 local function airdropSummary()
 	local falling, landed, nearest = 0, 0, nil
-	for _, inst in ipairs(CollectionService:GetTagged(AIR_TAG)) do
-		local state = inst:GetAttribute(AIR_STATE)
+	for _, inst in ipairs(CollectionService:GetTagged(Air.TAG)) do
+		local state = inst:GetAttribute(Air.STATE)
 		if state == "falling" then falling += 1
 		elseif state == "landed" then
 			landed += 1
@@ -1902,11 +1976,11 @@ local function airdropSummary()
 end
 
 local function airdropEligible()
-	if netWorth() < AIR_MIN_WORTH then
-		return false, string.format("needs %s net worth, you have %s", money(AIR_MIN_WORTH), money(netWorth()))
+	if netWorth() < Air.MIN_WORTH then
+		return false, string.format("needs %s net worth, you have %s", money(Air.MIN_WORTH), money(netWorth()))
 	end
 	local cash = tonumber(LP:GetAttribute("Cash")) or 0
-	if cash - AIR_FEE < S.keepCash then return false, "not enough cash for the " .. money(AIR_FEE) .. " entry" end
+	if cash - Air.FEE < S.keepCash then return false, "not enough cash for the " .. money(Air.FEE) .. " entry" end
 	return true
 end
 
@@ -1914,9 +1988,9 @@ end
 local function nextAirdrop()
 	local _, hrp = getChar()
 	local best, bestD
-	for _, inst in ipairs(CollectionService:GetTagged(AIR_TAG)) do
+	for _, inst in ipairs(CollectionService:GetTagged(Air.TAG)) do
 		local left = airdropTimeLeft(inst)
-		local g = inst:GetAttribute(AIR_STATE) == "landed" and (left or 0) > 25 and airdropGarage(inst)
+		local g = inst:GetAttribute(Air.STATE) == "landed" and (left or 0) > 25 and airdropGarage(inst)
 		local key = g and ("airdrop:" .. (g:GetAttribute("GUID") or g:GetFullName()))
 		if g and not g:GetAttribute("InAuction") and (Auto.blocked[key] or 0) < os.clock() then
 			local d = hrp and (g:GetPivot().Position - hrp.Position).Magnitude or 0
@@ -2702,12 +2776,332 @@ S.keybinds = type(saved.keybinds) == "table" and saved.keybinds or {}
 ui.onChange = function(id, value)
 	queueSave()
 	if id == "shopBar" then if Hub.quickBar then Hub.quickBar.Visible = value end
+	elseif id == "eventTimers" then if Hub.timers and Hub.timers.panel then Hub.timers.panel:SetVisible(value) end
+	elseif id == "instantPrompts" then if not value and Hub.restorePrompts then Hub.restorePrompts() end
 	elseif id == "adminGuard" or id == "adminExtra" then if Hub.checkStaff then task.spawn(Hub.checkStaff) end
 	elseif id == "theme" or id == "customBg" or id == "customAccent" or id == "customText" then
 		if Hub.applyTheme then Hub.applyTheme() end
 	elseif id == "esp" then setEsp(value)
 	elseif id == "espDistance" or id == "espMinConf" then applyEsp() end
 end
+
+---------------------------------------------------------------------------
+-- Lost items: glowing items around the map that only you can see
+-- (workspace._LostItems, LostOwnerId = you). Each has an "Add to Vehicle"
+-- prompt that works only with your car close by (about 30 studs; the server
+-- says "Your vehicle is too far away" otherwise). A collected item is renamed
+-- TossActor_* while it flies into the car, then removed.
+---------------------------------------------------------------------------
+local Lost = { running = false, stop = false, note = nil, msg = nil, CAR_RANGE = 26, trace = {}, added = 0 }
+function Lost.items()
+	local folder = workspace:FindFirstChild("_LostItems")
+	local out = {}
+	if not folder then return out end
+	for _, m in ipairs(folder:GetChildren()) do
+		if m:IsA("Model") and m:GetAttribute("LostOwnerId") == LP.UserId and not m.Name:find("^TossActor_") then
+			local base = m:FindFirstChild("Base")
+			local prompt = base and base:FindFirstChild("PickupPrompt")
+			if prompt and prompt:IsA("ProximityPrompt") then out[#out + 1] = { model = m, base = base, prompt = prompt } end
+		end
+	end
+	return out
+end
+function Lost.taken(it)
+	local m = it.model
+	return m.Parent == nil or m.Name:find("^TossActor_") ~= nil or it.prompt.Parent == nil
+end
+-- Collects every lost item, nearest first. Runs under the body lock.
+-- Returns how many were picked up and why it stopped early (nil if it finished).
+function Lost.pass()
+	local skip, why = {}, nil
+	local startAdded = Lost.added
+	local function got() return Lost.added - startAdded end
+	while true do
+		if halted() then why = "paused"; break end
+		if Lost.stop then why = "stopped"; break end
+		local _, hrp = getChar()
+		if not hrp then why = "no character"; break end
+		local best, bestD
+		for _, it in ipairs(Lost.items()) do
+			if not skip[it.model] then
+				local d = (it.base.Position - hrp.Position).Magnitude
+				if not bestD or d < bestD then best, bestD = it, d end
+			end
+		end
+		if not best then break end
+		local veh = myVehicle()
+		local w, lim = cargoOf(veh)
+		if lim and lim > 0 and w >= lim - 0.5 then why = "your car is full"; break end
+		local pos = best.base.Position
+		Lost.note = string.format("Getting %s (%d picked)", best.model.Name, got())
+		Auto.status = "Lost items: " .. Lost.note
+		if not veh or (veh:GetPivot().Position - pos).Magnitude > Lost.CAR_RANGE then
+			tpTo(pos)
+			veh = nil
+			local err
+			-- the server's spawn cooldown is longer than the V key's (~10 s): retry
+			local t0 = os.clock()
+			repeat
+				if halted() or Lost.stop then break end
+				placeNear(pos, 7)
+				task.wait(0.2)
+				local v
+				v, err = spawnCarHere()
+				exitVehicle() -- spawning seats you in the car
+				if v and (v:GetPivot().Position - pos).Magnitude <= Lost.CAR_RANGE + 10 then veh = v; break end
+				task.wait(1.5)
+			until os.clock() - t0 > 14
+			if not veh then
+				if halted() or Lost.stop then why = Lost.stop and "stopped" or "paused"; break end
+				why = "could not bring your car" .. (err and (": " .. tostring(err)) or ""); break
+			end
+		end
+		if halted() or Lost.stop then why = Lost.stop and "stopped" or "paused"; break end
+		placeNear(pos, 3)
+		task.wait(0.25)
+		Lost.msg = nil
+		local before = Lost.added
+		local function done() return Lost.taken(best) or Lost.added > before end
+		firePrompt(best.prompt, done)
+		local t0 = os.clock()
+		while not done() and not Lost.msg and os.clock() - t0 < 4 do task.wait(0.1) end
+		if not done() and not Lost.msg then
+			-- the server's notice can trail the prompt a little
+			t0 = os.clock()
+			while not done() and os.clock() - t0 < 1.5 do task.wait(0.1) end
+		end
+		local trace = Lost.trace
+		trace[#trace + 1] = string.format("%s: taken=%s added=%d msg=%s", best.model.Name,
+			tostring(Lost.taken(best)), Lost.added - before, tostring(Lost.msg))
+		if #trace > 40 then table.remove(trace, 1) end
+		if done() then
+			Auto.picked += 1
+		else
+			local msg = Lost.msg and Lost.msg:lower() or ""
+			if msg:find("full") or msg:find("space") or msg:find("weight") or msg:find("capacity") then
+				why = Lost.msg; break
+			end
+			skip[best.model] = true -- try the others; this one is left for later
+		end
+	end
+	Lost.msg = nil
+	return got(), why
+end
+-- The button: starts collecting, or stops a run in progress.
+function Lost.collect()
+	if Lost.running then
+		Lost.stop = true
+		ui:SetStatus("Stopping after this item", "busy")
+		return
+	end
+	if A.active then ui:SetStatus("Finish or leave the auction first", "busy"); return end
+	local total = #Lost.items()
+	if total == 0 then ui:SetStatus("No lost items on the map right now", "ok"); return end
+	if not myVehicle() and not LP:GetAttribute("EquippedVehicle") then ui:SetStatus("Equip a vehicle first", "busy"); return end
+	Lost.running, Lost.stop = true, false
+	if Locks.body.owner then ui:SetStatus("Lost items queued after " .. Locks.body.owner, "busy") end
+	local ok, got, why = runBody("lost items", Lost.pass)
+	Lost.running, Lost.stop = false, false
+	if not ok then
+		Lost.note = "Error: " .. tostring(got)
+	else
+		local left = #Lost.items()
+		Lost.note = string.format("Picked up %d%s", got or 0, left > 0 and string.format(", %d left", left) or ", all done")
+		if why then Lost.note = Lost.note .. " (" .. why .. ")" end
+	end
+	Auto.status = "Lost items: " .. Lost.note
+	ui:SetStatus(Auto.status, ok and "ok" or "busy")
+end
+Hub.lost = Lost -- test hook, like Hub.wouldKeep
+
+---------------------------------------------------------------------------
+-- Mining (The Mines). With a pickaxe in hand, the node's Mine prompt starts
+-- a session (it then reads "Stop Mining"; pressing again stops). The server
+-- pays a jewel every RewardSeconds / (1 + speed/100) while you stay within
+-- MineRange, until your inventory is full (MiningState.Stalled = "full").
+-- Each node needs a minimum net worth (MiningConfig.Nodes).
+---------------------------------------------------------------------------
+local Mine = { state = {}, rewards = 0, note = nil, lastTry = 0, starting = false, msg = nil }
+do
+	local ok, cfg = pcall(require, Modules:FindFirstChild("MiningConfig"))
+	Mine.cfg = ok and type(cfg) == "table" and cfg or {}
+end
+function Mine.nodesFolder()
+	local areas = workspace:FindFirstChild("Areas")
+	local area = areas and areas:FindFirstChild(Mine.cfg.AreaName or "The Mines")
+	return area and area:FindFirstChild(Mine.cfg.NodesFolderName or "RockNodes")
+end
+function Mine.minWorth(i)
+	local n = type(Mine.cfg.Nodes) == "table" and Mine.cfg.Nodes[i]
+	return n and tonumber(n.MinNetWorth) or math.huge
+end
+-- Active when the server said so, or when a node's prompt reads "Stop Mining"
+-- (the game relabels it; this also covers a session started before the hub).
+function Mine.activeNode()
+	if Mine.state.Active then return tonumber(Mine.state.Node) end
+	local folder = Mine.nodesFolder()
+	for _, m in ipairs(folder and folder:GetChildren() or {}) do
+		local p = m:FindFirstChild("MinePrompt", true)
+		if p and p:IsA("ProximityPrompt") and p.ActionText == "Stop Mining" then return tonumber(m:GetAttribute("NodeIndex") or m.Name) end
+	end
+	return nil
+end
+-- The node to mine: the one picked, or the best your net worth allows.
+-- The node models (and their positions) are always there; their parts and
+-- prompt only stream in near The Mines, so the prompt is looked up on arrival.
+function Mine.target()
+	local folder = Mine.nodesFolder()
+	if not folder then return nil, "The Mines are not loaded; go there first" end
+	local worth = netWorth()
+	local want = tonumber(tostring(S.mineNode or ""):match("(%d+)"))
+	local best
+	for _, m in ipairs(folder:GetChildren()) do
+		local i = tonumber(m:GetAttribute("NodeIndex") or m.Name)
+		if i and m:IsA("Model") then
+			if want then
+				if i == want then
+					if worth < Mine.minWorth(i) then return nil, string.format("Node %d needs %s net worth, you have %s", i, money(Mine.minWorth(i)), money(worth)) end
+					return { index = i, model = m }
+				end
+			elseif worth >= Mine.minWorth(i) and (not best or i > best.index) then
+				best = { index = i, model = m }
+			end
+		end
+	end
+	if want then return nil, "Node " .. want .. " was not found" end
+	if not best then return nil, string.format("Node 1 needs %s net worth, you have %s", money(Mine.minWorth(1)), money(worth)) end
+	return best
+end
+function Mine.promptOf(model)
+	local p = model and model:FindFirstChild("MinePrompt", true)
+	return p and p:IsA("ProximityPrompt") and p or nil
+end
+-- Your best pickaxe (by the config's speed range), and whether it is in hand.
+function Mine.pickaxe()
+	local picks = type(Mine.cfg.Pickaxes) == "table" and Mine.cfg.Pickaxes or {}
+	local function score(t)
+		if not t:IsA("Tool") then return nil end
+		local p = picks[tostring(t:GetAttribute("ItemId") or "")]
+		return p and (tonumber(p.MiningSpeed and p.MiningSpeed.max) or 0) or nil
+	end
+	local char = LP.Character
+	local held = char and char:FindFirstChildOfClass("Tool")
+	if held and score(held) then return held, true end
+	local best, bs
+	for _, t in ipairs(LP:FindFirstChildOfClass("Backpack") and LP.Backpack:GetChildren() or {}) do
+		local s = score(t)
+		if s and (not bs or s > bs) then best, bs = t, s end
+	end
+	return best, false
+end
+function Mine.equip()
+	local tool, held = Mine.pickaxe()
+	if not tool then return false end
+	if held then return true end
+	local _, _, hum = getChar()
+	if not hum then return false end
+	pcall(hum.EquipTool, hum, tool)
+	local t0 = os.clock()
+	repeat task.wait(0.1) until tool.Parent == LP.Character or os.clock() - t0 > 1.5
+	return tool.Parent == LP.Character
+end
+function Mine.anchor(prompt)
+	local a = prompt.Parent
+	if a and a:IsA("Attachment") then return a.WorldPosition end
+	if a and a:IsA("BasePart") then return a.Position end
+	return nil
+end
+-- Starts mining (runs under the body lock). The prompt toggles, so it is
+-- pressed once and only pressed again if nothing changed (never twice in a row).
+function Mine.start()
+	if halted() or Mine.activeNode() then return end
+	local t, why = Mine.target()
+	if not t then Mine.note = why; return end
+	if not Mine.pickaxe() then Mine.note = "No pickaxe in your backpack"; return end
+	local _, hrp = getChar()
+	if not hrp then return end
+	local p = Mine.promptOf(t.model)
+	if not p then
+		-- far away: go to the node so its prompt streams in
+		Mine.note = "Going to Rock Node " .. t.index
+		exitVehicle()
+		tpTo(t.model:GetPivot().Position)
+		local t0 = os.clock()
+		repeat task.wait(0.2); p = Mine.promptOf(t.model) until p or os.clock() - t0 > 6
+		if not p then Mine.note = "Rock Node " .. t.index .. " did not load"; return end
+	end
+	local pos = Mine.anchor(p)
+	if not pos then Mine.note = "Rock Node " .. t.index .. " has no prompt"; return end
+	if (hrp.Position - pos).Magnitude > 6 then
+		exitVehicle()
+		placeNear(pos, 4)
+		task.wait(0.3)
+	end
+	if halted() then return end
+	if not Mine.equip() then Mine.note = "No pickaxe in your backpack"; return end
+	Mine.note = "Starting Rock Node " .. t.index
+	Mine.starting, Mine.msg = true, nil
+	if p.HoldDuration > 0 then p.HoldDuration = 0 end
+	pcall(function() p:InputHoldBegin(); task.wait(0.05); p:InputHoldEnd() end)
+	local t0 = os.clock()
+	while not Mine.activeNode() and not Mine.msg and os.clock() - t0 < 2.5 do task.wait(0.1) end
+	if not Mine.activeNode() and not Mine.msg and type(fireproximityprompt) == "function" then
+		pcall(fireproximityprompt, p)
+		t0 = os.clock()
+		while not Mine.activeNode() and not Mine.msg and os.clock() - t0 < 2.5 do task.wait(0.1) end
+	end
+	Mine.starting = false
+	Mine.note = (not Mine.activeNode()) and (Mine.msg or "The node did not start") or nil
+end
+-- While mining: keep the pickaxe in hand and stay within reach of the node.
+function Mine.keep(index)
+	local folder = Mine.nodesFolder()
+	local node = folder and (folder:FindFirstChild(tostring(index)))
+	local prompt = node and node:FindFirstChild("MinePrompt", true)
+	local pos = prompt and Mine.anchor(prompt)
+	local _, hrp = getChar()
+	if pos and hrp and (hrp.Position - pos).Magnitude > (tonumber(Mine.cfg.MineRange) or 10) - 2 then
+		runBody("mining", function() exitVehicle(); placeNear(pos, 4) end)
+	end
+	local _, held = Mine.pickaxe()
+	if not held then runBody("mining", Mine.equip) end
+end
+function Mine.summary()
+	local st = Mine.state
+	local node = Mine.activeNode()
+	local count = Mine.rewards > 0 and string.format("  |  %d jewel%s this session%s", Mine.rewards, Mine.rewards == 1 and "" or "s",
+		Mine.last and (", last " .. Mine.last) or "") or ""
+	if node then
+		local every, progress = tonumber(st.Interval), tonumber(st.Progress)
+		local text = "Mining Rock Node " .. node
+		if every and every > 0 and progress then
+			-- Progress is the share of the interval done (0 to 1), sent about once a second
+			local left = math.max(0, every * (1 - progress) - (os.clock() - (Mine.stateAt or os.clock())))
+			text = text .. string.format(", next jewel in %d:%02d (every %d:%02d)", math.floor(left / 60), math.floor(left % 60), math.floor(every / 60), math.floor(every % 60))
+		end
+		if st.Stalled == "full" then text = "Inventory full: mining is paused. Sell or unload to resume." end
+		return text .. count
+	end
+	return (Mine.note or (S.autoMine and "Waiting to start" or "Off")) .. count
+end
+task.spawn(function()
+	while Hub.alive do
+		task.wait(2)
+		if S.autoMine and not halted() and not A.active and not S.autoAuction then
+			local node = Mine.activeNode()
+			if node then
+				Mine.note = nil
+				if not Locks.body.owner then pcall(Mine.keep, node) end
+			elseif not Locks.body.owner and os.clock() - Mine.lastTry > 10 then
+				Mine.lastTry = os.clock()
+				runBody("mining", Mine.start)
+			end
+		elseif S.autoMine and S.autoAuction then
+			Mine.note = "Paused: Find auctions is on"
+		end
+	end
+end)
+Hub.mine = Mine -- test hook
 
 -- Actions used by buttons on several tabs. Each takes the lock it needs.
 local function goToPlot()
@@ -2888,6 +3282,7 @@ home:Actions({
 home:Actions({
 	{ Text = "Go to my plot", Callback = goToPlot },
 	{ Text = "Leave auction", Callback = leaveAuction },
+	{ Text = "Lost items", Callback = function() Lost.collect() end },
 })
 home:Section("Right now")
 local cargoMeter = home:Meter("Cargo")
@@ -2923,7 +3318,7 @@ local lotInfo = auction:Info("Lot: -")
 auction:Section("Airdrops")
 auction:Toggle({ Id = "airdropAlerts", Text = "Alerts", Hint = "Pop-up when crates fall and land", Default = D("airdropAlerts", true) })
 auction:Toggle({ Id = "airdropMarkers", Text = "Markers", Hint = "Countdown over each crate", Default = D("airdropMarkers", true) })
-auction:Toggle({ Id = "autoAirdrop", Text = "Open airdrops", Hint = "Needs " .. money(AIR_MIN_WORTH) .. " net worth", Default = D("autoAirdrop", false) })
+auction:Toggle({ Id = "autoAirdrop", Text = "Open airdrops", Hint = "Needs " .. money(Air.MIN_WORTH) .. " net worth", Default = D("autoAirdrop", false) })
 local airInfo = auction:Info("Airdrops: none right now")
 auction:Section("More options", { Collapsible = true, Collapsed = true })
 auction:Number({ Id = "bidDelay", Text = "Bid delay", Default = D("bidDelay", 0.35), Min = 0.05, Max = 3, Suffix = "s" })
@@ -2963,6 +3358,17 @@ loot:Section("Safes and vaults")
 loot:Toggle({ Id = "safeLocksmith", Text = "Use the Locksmith too", Hint = "For safes your lockpick is not good enough for", Default = D("safeLocksmith", true) })
 local safeInfo = loot:Info("Turn on Open safes on Home")
 loot:Actions({ { Text = "Open safes now", Callback = function() runItems("open safes", Safe.pass) end } })
+loot:Section("Lost items")
+Lost.info = loot:Info("-")
+loot:Actions({ { Text = "Collect lost items", Callback = function() Lost.collect() end } })
+loot:Section("Mining")
+loot:Toggle({ Id = "autoMine", Text = "Auto mine", Hint = "Needs a pickaxe; waits while Find auctions is on", Default = D("autoMine", false) })
+do
+	local opts = {}
+	for i = 1, 10 do opts[i] = string.format("Node %d (%s)", i, money(Mine.minWorth(i))) end
+	loot:List({ Id = "mineNode", Text = "Rock node", Hint = "Net worth needed; none = best you can", Multi = false, Options = opts, Empty = "Best I can" })
+end
+Mine.info = loot:Info("-")
 
 ---------------------------------------------------------------------------
 -- Stats: what the hub did this session.
@@ -3066,6 +3472,7 @@ playerTab:Number({ Id = "jp", Text = "Power", Default = D("jp", 75), Min = 50, M
 playerTab:Toggle({ Id = "infJump", Text = "Infinite jump", Default = D("infJump", false) })
 playerTab:Toggle({ Id = "noclip", Text = "Noclip", Default = D("noclip", false) })
 playerTab:Toggle({ Id = "antiAfk", Text = "Anti AFK", Default = D("antiAfk", true) })
+playerTab:Toggle({ Id = "instantPrompts", Text = "Instant hold E", Hint = "Prompts you would hold fire on a tap", Default = D("instantPrompts", true) })
 playerTab:Section("Admin safety")
 playerTab:Toggle({ Id = "adminGuard", Text = "Pause when an admin joins", Hint = "Stops everything until they leave", Default = D("adminGuard", true) })
 playerTab:Toggle({ Id = "adminExtra", Text = "Count testers and creators", Hint = "Not just admins and moderators", Default = D("adminExtra", false) })
@@ -3096,6 +3503,126 @@ local function applyTheme()
 	for _, c in ipairs(customColors) do c.row.Visible = name == "Custom" end
 end
 Hub.applyTheme = applyTheme
+playerTab:Toggle({ Id = "eventTimers", Text = "Event timers on screen", Hint = "Left side of the screen; drag it to move", Default = D("eventTimers", true) })
+
+---------------------------------------------------------------------------
+-- Event timers: a small panel on the left with the game's own schedule
+-- (SpecialEventManager: cargo ship and train, weather, night and season
+-- events), your seized-garage timer and live airdrop crates. Airdrops have
+-- no schedule the client can see, so they show only once a crate is out.
+---------------------------------------------------------------------------
+local Timers = { cache = {}, events = {} }
+do
+	local okM, SEM = pcall(require, Modules:FindFirstChild("SpecialEventManager"))
+	local okC, SEC = pcall(require, Modules:FindFirstChild("SpecialEventConfig"))
+	Timers.SEM = okM and type(SEM) == "table" and SEM or nil
+	if okC and type(SEC) == "table" and type(SEC.Events) == "table" then Timers.events = SEC.Events end
+end
+function Timers.clock(s)
+	s = math.max(0, math.floor(s))
+	if s >= 3600 then return string.format("%dh %02dm", math.floor(s / 3600), math.floor((s % 3600) / 60)) end
+	return string.format("%d:%02d", math.floor(s / 60), s % 60)
+end
+-- The game's schedule code reads your PC clock (os.time) unless it is given a
+-- time, so a wrong or changed clock would give wrong times. Every call here
+-- passes the server's clock instead, plus the game's own DevTimeOffset.
+function Timers.serverNow()
+	local off = tonumber(game:GetService("Lighting"):GetAttribute("DevTimeOffset")) or 0
+	return math.floor(workspace:GetServerTimeNow() + off)
+end
+-- Next start, cached for 2 minutes or until it passes (the manager works it
+-- out from seeded random gaps, the same on every client).
+function Timers.nextStart(ev, now)
+	local c = Timers.cache[ev.Name]
+	if c and now - c.checked < 120 and (c.at == nil or c.at > now) then return c.at end
+	local SEM, at = Timers.SEM, nil
+	local t = Timers.serverNow()
+	local ok, v = pcall(SEM.GetNextConcurrentStart, SEM, ev.Name, t)
+	if ok and type(v) == "number" then at = v end
+	if not at then
+		ok, v = pcall(SEM.GetNextEventStart, SEM, ev.Name, t)
+		if ok and type(v) == "number" then at = v end
+	end
+	Timers.cache[ev.Name] = { at = at, checked = now }
+	return at
+end
+function Timers.rows()
+	local now = workspace:GetServerTimeNow()
+	local live, soon, seen = {}, {}, {}
+	local Lighting = game:GetService("Lighting")
+	local SEM = Timers.SEM
+	local function liveRow(name, left)
+		local text = name
+		if name == "Cargo Train" then
+			local station = Lighting:GetAttribute("CargoTrainStation")
+			if Lighting:GetAttribute("CargoTrainPhase") == "Stopped" and station then text = "Cargo Train, stop " .. tostring(station) end
+		end
+		seen[name] = true
+		live[#live + 1] = { Text = text, Value = "LIVE " .. Timers.clock(left), State = "live", sort = left }
+	end
+	if SEM then
+		local t = Timers.serverNow()
+		for _, ev in ipairs(Timers.events) do
+			if type(ev) == "table" and type(ev.Name) == "string" and ev.Enabled ~= false then
+				local okA, active = pcall(SEM.IsEventActive, SEM, ev.Name, t)
+				if okA and active then
+					local okL, left = pcall(SEM.GetEventTimeRemaining, SEM, ev.Name, t)
+					liveRow(ev.Name, okL and tonumber(left) or 0)
+				elseif ev.Scheduled ~= false then -- unscheduled ones (meltdown, police) start on a trigger
+					local at = Timers.nextStart(ev, now)
+					if at and at > now then
+						soon[#soon + 1] = { Text = ev.Name, Value = Timers.clock(at - now), State = at - now <= 300 and "soon" or nil, sort = at - now }
+					end
+				end
+			end
+		end
+	end
+	-- the server's own record of the main event, in case the manager missed it
+	local name, ends = Lighting:GetAttribute("ActiveSpecialEvent"), tonumber(Lighting:GetAttribute("SpecialEventEndsAt"))
+	if type(name) == "string" and name ~= "" and ends and ends > now and not seen[name] then liveRow(name, ends - now) end
+	local seized = tonumber(LP:GetAttribute("PoliceSeizedGarageNextDueUnix"))
+	if seized and seized > now then
+		soon[#soon + 1] = { Text = "Seized garage", Value = Timers.clock(seized - now), State = seized - now <= 300 and "soon" or nil, sort = seized - now }
+	end
+	local falling, landed, nearest = airdropSummary()
+	if landed > 0 then
+		live[#live + 1] = { Text = landed > 1 and string.format("Airdrops (%d)", landed) or "Airdrop", Value = "LIVE " .. Timers.clock(nearest or 0), State = "live", sort = nearest or 0 }
+	elseif falling > 0 then
+		live[#live + 1] = { Text = "Airdrop", Value = "FALLING", State = "live", sort = 0 }
+	end
+	table.sort(live, function(a, b) return a.sort < b.sort end)
+	table.sort(soon, function(a, b) return a.sort < b.sort end)
+	local out = {}
+	-- the game's own banners and countdowns use your PC clock; say so if it is off
+	local drift = os.time() - now
+	if math.abs(drift) >= 10 then
+		out[1] = { Text = drift > 0 and "PC clock ahead" or "PC clock behind", Value = Timers.clock(math.abs(drift)), State = "soon" }
+	end
+	for _, r in ipairs(live) do out[#out + 1] = r end
+	for _, r in ipairs(soon) do out[#out + 1] = r end
+	while #out > 10 do table.remove(out) end
+	return out
+end
+do
+	S.timersPos = D("timersPos", {})
+	local p = S.timersPos
+	local pos = (type(p[1]) == "number" and type(p[4]) == "number") and UDim2.new(p[1], p[2], p[3], p[4]) or UDim2.fromOffset(12, 96)
+	Timers.panel = ui:SidePanel({ Title = "EVENTS", Empty = "Nothing scheduled", Position = pos, OnMoved = function(u)
+		S.timersPos = { u.X.Scale, u.X.Offset, u.Y.Scale, u.Y.Offset }
+		queueSave()
+	end })
+	Timers.panel:SetVisible(S.eventTimers ~= false)
+	task.spawn(function()
+		while Hub.alive do
+			if S.eventTimers ~= false then
+				local ok, rows = pcall(Timers.rows)
+				if ok then Timers.panel:SetRows(rows) end
+			end
+			task.wait(1)
+		end
+	end)
+end
+Hub.timers = Timers
 playerTab:Section("Keybinds")
 playerTab:Toggle({ Id = "keybindNotify", Text = "Keybind notifications", Hint = "Shows ON or OFF when a key flips a switch", Default = D("keybindNotify", true) })
 playerTab:Info("Click the small box next to any switch, then press a key. Give several switches the same key and it toggles them together (all on, or all off if they already are); shared keys show a *. Backspace clears. Insert shows or hides this window.")
@@ -3148,6 +3675,13 @@ local function refreshHome()
 	steps.keep.SetDetail(keepRulesText())
 	steps.safe.SetDetail(Safe.note or (S.safeLocksmith and "Lockpick, then Locksmith" or "Lockpick only"))
 	safeInfo(Safe.note or "Waiting for safes in your inventory")
+	do
+		local n = #Lost.items()
+		local head = n > 0 and string.format("%d on the map. Your car is brought to each one.", n) or "None on the map right now"
+		Lost.info(Lost.running and ("Collecting: " .. (Lost.note or "...") .. "  |  press again to stop")
+			or (Lost.note and (head .. "  |  last run: " .. Lost.note) or head))
+	end
+	Mine.info(Mine.summary())
 	local range
 	if S.listMin > 0 and S.listMax > 0 then range = money(S.listMin) .. " to " .. money(S.listMax)
 	elseif S.listMin > 0 then range = money(S.listMin) .. "+"
@@ -3256,6 +3790,22 @@ on(Rm.Paused and Rm.Paused.OnClientEvent, function(paused, garage)
 	if not garage or not A.garage or garage == A.garage then A.paused = paused == true end
 end)
 on(Rm.SpawnResult and Rm.SpawnResult.OnClientEvent, function(ok, msg) Auto.spawnResult = { ok = ok, msg = msg } end)
+-- the game's red/green notices; lost-item pickups read "Added to vehicle!" or the reason it failed
+on(Rm.MiningState and Rm.MiningState.OnClientEvent, function(st)
+	if type(st) ~= "table" then return end
+	if type(st.Reward) == "table" then -- a jewel, not a state change
+		Mine.rewards += 1
+		local r = st.Reward
+		Mine.last = r.Name and (tostring(r.Name) .. (r.Rarity and (" (" .. tostring(r.Rarity) .. ")") or "")) or Mine.last
+		return
+	end
+	Mine.state, Mine.stateAt = st, os.clock()
+end)
+on(Rm.Notify and Rm.Notify.OnClientEvent, function(msg)
+	if Mine.starting and type(msg) == "string" then Mine.msg = msg end
+	if not (Lost.running and type(msg) == "string") then return end
+	if msg:find("Added to vehicle", 1, true) then Lost.added += 1 else Lost.msg = msg end
+end)
 on(Rm.OfferOverweight and Rm.OfferOverweight.OnClientEvent, function() Auto.overweightAt = os.clock() end)
 
 -- a sale frees a shelf slot: fill it again soon (and count it)
@@ -3275,6 +3825,27 @@ on(Rm.FeePaid and Rm.FeePaid.OnClientEvent, function(amount, currency)
 	if currency == nil or currency == "Cash" then Stats.entryFees += tonumber(amount) or 0 end
 end)
 
+-- Instant hold E: prompts you would hold (mining, pickups, boxes) fire on a
+-- tap. The hold time is set to 0 when a prompt shows; the old values come
+-- back when the switch goes off or the hub unloads.
+do
+	local PPS = game:GetService("ProximityPromptService")
+	local original = setmetatable({}, { __mode = "k" })
+	local function instant(p)
+		if S.instantPrompts and p:IsA("ProximityPrompt") and p.HoldDuration > 0 then
+			if original[p] == nil then original[p] = p.HoldDuration end
+			p.HoldDuration = 0
+		end
+	end
+	on(PPS.PromptShown, instant)
+	on(PPS.PromptButtonHoldBegan, instant)
+	function Hub.restorePrompts()
+		for p, hold in pairs(original) do
+			if p.Parent and p.HoldDuration == 0 then pcall(function() p.HoldDuration = hold end) end
+		end
+		table.clear(original)
+	end
+end
 on(game:GetService("UserInputService").JumpRequest, function()
 	if not S.infJump then return end
 	local _, _, hum = getChar()
@@ -3302,10 +3873,10 @@ local markerFolder = Instance.new("Folder")
 markerFolder.Name = "SHHubAirdrops"
 markerFolder.Parent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
 local markers = {}
-local AIR_COLOR = typeof(AirCfg.MarkerColor) == "Color3" and AirCfg.MarkerColor or Color3.fromRGB(150, 170, 90)
+local AIR_COLOR = typeof(Air.cfg.MarkerColor) == "Color3" and Air.cfg.MarkerColor or Color3.fromRGB(150, 170, 90)
 
 local function refreshAirdrops()
-	local tagged = CollectionService:GetTagged(AIR_TAG)
+	local tagged = CollectionService:GetTagged(Air.TAG)
 	local live = {}
 	for _, inst in ipairs(tagged) do live[inst] = true end
 	for inst, m in pairs(markers) do
@@ -3338,7 +3909,7 @@ local function refreshAirdrops()
 				end
 			end
 			if m then
-				local state = inst:GetAttribute(AIR_STATE)
+				local state = inst:GetAttribute(Air.STATE)
 				local left = airdropTimeLeft(inst)
 				local line
 				if state == "falling" then line = "falling"
@@ -3551,6 +4122,7 @@ end)
 function Hub.stop()
 	if not Hub.alive then return end
 	Hub.alive = false
+	if Hub.restorePrompts then pcall(Hub.restorePrompts) end
 	local _, _, hum = getChar()
 	if hum then
 		if S.wsOn then hum.WalkSpeed = 16 end
